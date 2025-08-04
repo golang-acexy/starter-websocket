@@ -309,7 +309,7 @@ func (c *WSClient) startSender() {
 			select {
 			case data := <-c.sendChan:
 				if !c.IsConnected() {
-					logger.Logrus().Debugln("not connected, dropping message")
+					logger.Logrus().Warningln("not connected, dropping message")
 					continue
 				}
 
@@ -318,7 +318,7 @@ func (c *WSClient) startSender() {
 				c.stateMux.RUnlock()
 
 				if conn == nil {
-					logger.Logrus().Debugln("connection is nil in sender")
+					logger.Logrus().Warningln("connection is nil in sender")
 					continue
 				}
 
@@ -379,7 +379,7 @@ func (c *WSClient) handleConnectionError(err error) {
 	if currentState == StateClosed || currentState == StateReconnecting {
 		return
 	}
-	logger.Logrus().Debugf("websocket connection error: %v", err)
+	logger.Logrus().Debugln("websocket connection error: %v", err)
 	// 判断是否需要重连
 	if c.shouldReconnect(err) {
 		c.reconnect()
@@ -405,7 +405,7 @@ func (c *WSClient) reconnect() {
 	}
 
 	c.setState(StateReconnecting)
-	logger.Logrus().Infoln("starting websocket reconnection process")
+	logger.Logrus().Warningln("starting websocket reconnection process")
 
 	go func() {
 		backoffDelay := c.reconnectInterval
@@ -413,11 +413,11 @@ func (c *WSClient) reconnect() {
 
 		for attempt := 1; attempt <= c.maxReconnectAttempts; attempt++ {
 			if c.GetState() == StateClosed {
-				logger.Logrus().Debugln("reconnect cancelled: client closed")
+				logger.Logrus().Warningln("reconnect cancelled: client closed")
 				return
 			}
 
-			logger.Logrus().Infof("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
+			logger.Logrus().Warningln("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
 
 			// 确保旧连接完全关闭
 			c.stateMux.Lock()
@@ -429,7 +429,7 @@ func (c *WSClient) reconnect() {
 
 			// 等待一段时间再重连，使用指数退避
 			if attempt > 1 {
-				logger.Logrus().Debugf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
+				logger.Logrus().Warningln("waiting %v before reconnect attempt %d", backoffDelay, attempt)
 				select {
 				case <-time.After(backoffDelay):
 				case <-c.ctx.Done():
