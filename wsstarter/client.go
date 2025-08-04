@@ -18,10 +18,10 @@ type WSData struct {
 }
 
 func (w *WSData) ToString() string {
-	//if w.Type == websocket.MessageText {
-	return string(w.Data)
-	//}
-	//return fmt.Sprintf("%x", w.Data)
+	if w.Type == websocket.MessageText {
+		return string(w.Data)
+	}
+	return fmt.Sprintf("%x", w.Data)
 }
 
 // ConnectionState 连接状态枚举
