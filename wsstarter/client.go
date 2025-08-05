@@ -123,7 +123,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		config.SendChanBufferLen = 100
 	}
 	if config.HeartbeatTimeout == 0 {
-		config.HeartbeatTimeout = time.Second * 10 // 默认10秒心跳超时
+		config.HeartbeatTimeout = time.Second * 60 // 默认60秒心跳超时
 	}
 
 	client := &WSClient{
