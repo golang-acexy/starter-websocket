@@ -72,7 +72,7 @@ type WSClient struct {
 	onConnect    func()
 	onDisconnect func(error)
 	onError      func(error)
-	onClose      func(error) // 客户端关闭时
+	onClose      func(error) // 客户端关闭时的一次性回调
 
 	// 优雅关闭
 	closeOnce sync.Once
@@ -316,8 +316,6 @@ func (c *WSClient) startHeartbeat() {
 		// 等待第一次心跳发送完成
 		select {
 		case <-firstHeartbeatSent:
-			// 第一次心跳已发送，重置lastPongTime为当前时间作为基准
-			c.lastPongTime.Store(time.Now())
 			if c.showHeartbeatTraceLogger {
 				logger.Logrus().Traceln("heartbeat monitor starting after first heartbeat sent")
 			}
@@ -339,8 +337,11 @@ func (c *WSClient) startHeartbeat() {
 
 		select {
 		case <-time.After(initialDelay):
+			// 延迟等待结束后，重新设置lastPongTime为当前时间作为检测基准
+			// 这样可以避免在延迟期间收到的心跳响应导致的时间基准问题
+			c.lastPongTime.Store(time.Now())
 			if c.showHeartbeatTraceLogger {
-				logger.Logrus().Tracef("heartbeat timeout detection started after %v delay", initialDelay)
+				logger.Logrus().Tracef("heartbeat timeout detection started after %v delay, reset baseline time", initialDelay)
 			}
 		case <-heartbeatCtx.Done():
 			logger.Logrus().Traceln("websocket client heartbeat monitor exit during initial wait")
