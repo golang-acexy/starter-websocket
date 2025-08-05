@@ -11,9 +11,9 @@ import (
 
 func TestClient(t *testing.T) {
 	logger.EnableConsole(logger.TraceLevel, false)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL: "wss://xxx",
+		URL: "https://",
 		OnConnect: func() {
 			t.Log("connect")
 		},
@@ -25,6 +25,7 @@ func TestClient(t *testing.T) {
 	chn, err := client.Connect()
 	if err != nil {
 		t.Error(err)
+		cancel()
 		return
 	}
 	go func() {
@@ -37,5 +38,6 @@ func TestClient(t *testing.T) {
 		}
 	}()
 	sys.ShutdownHolding()
+	cancel()
 	_ = client.Close()
 }

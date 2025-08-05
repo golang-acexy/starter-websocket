@@ -51,10 +51,13 @@ type WSClient struct {
 	reconnectInterval    time.Duration
 
 	// 心跳配置
-	heartbeatInterval time.Duration
-	heartbeatPingData string
-	heartbeatPongData string
-	heartbeatCancel   context.CancelFunc
+	heartbeatInterval        time.Duration
+	heartbeatTimeout         time.Duration // 心跳超时时间
+	heartbeatPingData        string
+	heartbeatPongData        string
+	heartbeatCancel          context.CancelFunc
+	showHeartbeatTraceLogger bool
+	lastPongTime             atomic.Value // time.Time - 最后收到pong的时间
 
 	// 数据通道
 	blockReceive bool
@@ -72,6 +75,9 @@ type WSClient struct {
 
 	// 优雅关闭
 	closeOnce sync.Once
+
+	// 用于跟踪各个协程的完成状态
+	workerWg sync.WaitGroup
 }
 
 // WSClientConfig 配置结构
@@ -84,6 +90,13 @@ type WSClientConfig struct {
 	WorkerCount          int
 	SendChanBufferLen    int
 
+	BlockReceive bool // 阻塞式接收数据
+	BlockSender  bool // 阻塞式发送数据
+
+	// 心跳超时配置
+	HeartbeatTimeout         time.Duration
+	ShowHeartbeatTraceLogger bool
+
 	// 回调函数
 	OnConnect    func()
 	OnDisconnect func(error)
@@ -92,8 +105,6 @@ type WSClientConfig struct {
 
 func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	ctx, cancel := context.WithCancel(ctx)
-
-	// 设置默认值
 	if config.MaxReconnectAttempts == 0 {
 		config.MaxReconnectAttempts = 5
 	}
@@ -109,23 +120,44 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	if config.SendChanBufferLen == 0 {
 		config.SendChanBufferLen = 100
 	}
+	if config.HeartbeatTimeout == 0 {
+		config.HeartbeatTimeout = time.Second * 60 // 默认60秒心跳超时
+	}
 
 	client := &WSClient{
-		ctx:                  ctx,
-		cancel:               cancel,
-		url:                  config.URL,
-		opts:                 config.DialOptions,
-		maxReconnectAttempts: config.MaxReconnectAttempts,
-		reconnectInterval:    config.ReconnectInterval,
-		receiveChan:          make(chan *WSData, config.ChanBufferLen),
-		sendChan:             make(chan *WSData, config.SendChanBufferLen),
-		onConnect:            config.OnConnect,
-		onDisconnect:         config.OnDisconnect,
-		onError:              config.OnError,
+		ctx:                      ctx,
+		cancel:                   cancel,
+		url:                      config.URL,
+		opts:                     config.DialOptions,
+		maxReconnectAttempts:     config.MaxReconnectAttempts,
+		reconnectInterval:        config.ReconnectInterval,
+		heartbeatTimeout:         config.HeartbeatTimeout,
+		receiveChan:              make(chan *WSData, config.ChanBufferLen),
+		sendChan:                 make(chan *WSData, config.SendChanBufferLen),
+		onConnect:                config.OnConnect,
+		onDisconnect:             config.OnDisconnect,
+		onError:                  config.OnError,
+		showHeartbeatTraceLogger: config.ShowHeartbeatTraceLogger,
+		blockReceive:             config.BlockReceive,
+		blockSender:              config.BlockSender,
 	}
 
 	client.setState(StateDisconnected)
+	client.lastPongTime.Store(time.Now())
+
+	// 启动context监听协程，当context取消时执行优雅关闭
+	client.workerWg.Add(1)
+	go client.contextMonitor()
+
 	return client
+}
+
+// contextMonitor 监听context取消事件，执行优雅关闭
+func (c *WSClient) contextMonitor() {
+	defer c.workerWg.Done()
+	<-c.ctx.Done()
+	logger.Logrus().Traceln("context cancelled, initiating graceful shutdown")
+	_ = c.Close()
 }
 
 // setState 设置连接状态
@@ -144,7 +176,13 @@ func (c *WSClient) IsConnected() bool {
 }
 
 // SetHeartbeat 设置心跳 该函数需要在Connect函数之前注册
-// pongData 消息处理器会自动忽略该消息，不会向业务层发送该数据，如果需要，则pongData不设置
+// 有两种心跳模式：
+//  1. 自定义心跳：设置pingData和pongData，客户端会发送pingData并期望收到pongData响应
+//     收到正确的pongData时会更新最后心跳时间，如果超时未收到则触发重连
+//  2. 原生心跳：只设置interval，pingData和pongData留空，使用WebSocket原生ping/pong帧
+//     原生ping发送成功时会更新最后心跳时间，如果ping发送失败或超时未更新则触发重连
+//
+// 无论使用哪种模式，都会启动心跳超时检测，超过heartbeatTimeout时间未更新心跳则重连
 func (c *WSClient) SetHeartbeat(interval time.Duration, pingData, pongData string) {
 	if c.IsConnected() {
 		logger.Logrus().Warningln("heartbeat cannot be set after the connection is established")
@@ -164,21 +202,96 @@ func (c *WSClient) startHeartbeat() {
 	c.stopHeartbeat()
 	heartbeatCtx, cancel := context.WithCancel(c.ctx)
 	c.heartbeatCancel = cancel
-	ticker := time.NewTicker(c.heartbeatInterval)
+
+	// 重置最后pong时间
+	c.lastPongTime.Store(time.Now())
+
+	// 心跳发送协程
+	c.workerWg.Add(1)
 	go func() {
+		defer c.workerWg.Done()
+		ticker := time.NewTicker(c.heartbeatInterval)
 		defer ticker.Stop()
+
 		for {
 			select {
 			case <-ticker.C:
 				if c.IsConnected() {
 					if c.heartbeatPingData != "" {
-						_ = c.Send(websocket.MessageText, []byte(c.heartbeatPingData))
+						// 使用自定义心跳消息
+						err := c.Send(websocket.MessageText, []byte(c.heartbeatPingData))
+						if err != nil {
+							logger.Logrus().Debugf("send heartbeat ping failed: %v", err)
+							c.handleConnectionError(err)
+							return
+						}
 					} else {
-						_ = c.conn.Ping(context.Background())
+						// 使用WebSocket原生ping
+						c.stateMux.RLock()
+						conn := c.conn
+						c.stateMux.RUnlock()
+
+						if conn != nil {
+							pingCtx, pingCancel := context.WithTimeout(c.ctx, time.Second*5)
+							err := conn.Ping(pingCtx)
+							pingCancel()
+
+							if err != nil {
+								logger.Logrus().Debugf("ping failed: %v", err)
+								c.handleConnectionError(err)
+								return
+							} else {
+								// ping成功发送，更新时间（对于原生心跳，ping成功表示连接正常）
+								c.lastPongTime.Store(time.Now())
+								logger.Logrus().Traceln("native ping sent successfully")
+							}
+						}
 					}
 				}
 			case <-heartbeatCtx.Done():
-				logger.Logrus().Traceln("websocket client heartbeat exit")
+				logger.Logrus().Traceln("websocket client heartbeat sender exit")
+				return
+			}
+		}
+	}()
+
+	// 启动心跳超时检测协程（适用于所有心跳模式）
+	c.workerWg.Add(1)
+	go func() {
+		defer c.workerWg.Done()
+		// 检测频率为心跳间隔的一半，但不超过30秒，不少于1秒
+		checkInterval := c.heartbeatInterval / 2
+		if checkInterval > time.Second*30 {
+			checkInterval = time.Second * 30
+		}
+		if checkInterval < time.Second {
+			checkInterval = time.Second
+		}
+
+		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if c.IsConnected() {
+					lastPong := c.lastPongTime.Load().(time.Time)
+					timeSinceLastPong := time.Since(lastPong)
+					if timeSinceLastPong > c.heartbeatTimeout {
+						if c.heartbeatPingData != "" && c.heartbeatPongData != "" {
+							logger.Logrus().Warningf("custom heartbeat timeout detected (last pong: %v ago, timeout: %v), triggering reconnect", timeSinceLastPong, c.heartbeatTimeout)
+						} else {
+							logger.Logrus().Warningf("native heartbeat timeout detected (last ping success: %v ago, timeout: %v), triggering reconnect", timeSinceLastPong, c.heartbeatTimeout)
+						}
+						c.handleConnectionError(errors.New("heartbeat timeout"))
+						return
+					}
+					if c.showHeartbeatTraceLogger {
+						logger.Logrus().Tracef("heartbeat check: last activity %v ago, timeout threshold %v", timeSinceLastPong, c.heartbeatTimeout)
+					}
+				}
+			case <-heartbeatCtx.Done():
+				logger.Logrus().Traceln("websocket client heartbeat monitor exit")
 				return
 			}
 		}
@@ -224,17 +337,17 @@ func (c *WSClient) dial() error {
 	if err != nil {
 		return err
 	}
-
 	c.stateMux.Lock()
 	c.conn = conn
 	c.stateMux.Unlock()
-
 	return nil
 }
 
 // startMessageHandlers 启动消息处理协程
 func (c *WSClient) startMessageHandlers() {
+	c.workerWg.Add(1)
 	go func() {
+		defer c.workerWg.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Logrus().Errorf("websocket message handler panic: %v", r)
@@ -245,7 +358,7 @@ func (c *WSClient) startMessageHandlers() {
 		for {
 			select {
 			case <-c.ctx.Done():
-				logger.Logrus().Traceln("websocket client message handler exit")
+				logger.Logrus().Traceln("websocket client message handler exit due to context cancellation")
 				return
 			default:
 				state := c.GetState()
@@ -267,27 +380,41 @@ func (c *WSClient) startMessageHandlers() {
 					return
 				}
 
-				readCtx, cancel := context.WithTimeout(c.ctx, time.Second*30)
-				messageType, data, err := conn.Read(readCtx)
-				cancel()
-				if c.heartbeatPongData != "" && messageType == websocket.MessageText && string(data) == c.heartbeatPongData {
-					continue
-				}
+				// 移除超时设置，让Read操作阻塞直到有消息或连接断开
+				messageType, data, err := conn.Read(c.ctx)
+
 				if err != nil {
+					// 检查是否是context取消导致的错误
+					if c.ctx.Err() != nil {
+						logger.Logrus().Traceln("websocket read interrupted by context cancellation")
+						return
+					}
 					logger.Logrus().Debugf("websocket read error: %v", err)
 					c.handleConnectionError(err)
 					return
+				}
+
+				// 检查是否是自定义心跳pong消息
+				if c.heartbeatPongData != "" && messageType == websocket.MessageText && string(data) == c.heartbeatPongData {
+					// 更新最后收到pong的时间
+					c.lastPongTime.Store(time.Now())
+					continue
+				}
+
+				// 处理普通消息
+				if c.blockReceive {
+					select {
+					case c.receiveChan <- &WSData{Type: messageType, Data: data}:
+					case <-c.ctx.Done():
+						return
+					}
 				} else {
-					if c.blockReceive {
-						c.receiveChan <- &WSData{Type: messageType, Data: data}
-					} else {
-						select {
-						case c.receiveChan <- &WSData{Type: messageType, Data: data}:
-						case <-c.ctx.Done():
-							return
-						default:
-							logger.Logrus().Warnln("websocket data channel is full, dropping message")
-						}
+					select {
+					case c.receiveChan <- &WSData{Type: messageType, Data: data}:
+					case <-c.ctx.Done():
+						return
+					default:
+						logger.Logrus().Warnln("websocket data channel is full, dropping message")
 					}
 				}
 			}
@@ -297,7 +424,9 @@ func (c *WSClient) startMessageHandlers() {
 
 // startSender 启动发送协程
 func (c *WSClient) startSender() {
+	c.workerWg.Add(1)
 	go func() {
+		defer c.workerWg.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Logrus().Errorf("websocket sender panic: %v", r)
@@ -322,11 +451,16 @@ func (c *WSClient) startSender() {
 					continue
 				}
 
-				// 设置写入超时
+				// 设置写入超时（写入超时是合理的）
 				writeCtx, cancel := context.WithTimeout(c.ctx, time.Second*10)
 				err := conn.Write(writeCtx, data.Type, data.Data)
 				cancel()
 				if err != nil {
+					// 检查是否是context取消导致的错误
+					if c.ctx.Err() != nil {
+						logger.Logrus().Traceln("websocket write interrupted by context cancellation")
+						return
+					}
 					logger.Logrus().Debugf("websocket write error: %v", err)
 					if c.onError != nil {
 						c.onError(err)
@@ -335,7 +469,7 @@ func (c *WSClient) startSender() {
 					go c.handleConnectionError(err)
 				}
 			case <-c.ctx.Done():
-				logger.Logrus().Traceln("websocket client sender exit")
+				logger.Logrus().Traceln("websocket client sender exit due to context cancellation")
 				return
 			}
 		}
@@ -349,8 +483,12 @@ func (c *WSClient) Send(messageType websocket.MessageType, data []byte) error {
 	}
 
 	if c.blockSender {
-		c.sendChan <- &WSData{Type: messageType, Data: data}
-		return nil
+		select {
+		case c.sendChan <- &WSData{Type: messageType, Data: data}:
+			return nil
+		case <-c.ctx.Done():
+			return errors.New("client is closing")
+		}
 	} else {
 		select {
 		case c.sendChan <- &WSData{Type: messageType, Data: data}:
@@ -375,11 +513,23 @@ func (c *WSClient) SendBinary(data []byte) error {
 
 // handleConnectionError 处理连接错误
 func (c *WSClient) handleConnectionError(err error) {
+	// 检查是否是context取消导致的错误
+	if c.ctx.Err() != nil {
+		logger.Logrus().Traceln("connection error ignored due to context cancellation")
+		return
+	}
+
 	currentState := c.GetState()
 	if currentState == StateClosed || currentState == StateReconnecting {
 		return
 	}
-	logger.Logrus().Debugln("websocket connection error: %v", err)
+	logger.Logrus().Debugf("websocket connection error: %v", err)
+
+	// 调用断开连接回调
+	if c.onDisconnect != nil {
+		c.onDisconnect(err)
+	}
+
 	// 判断是否需要重连
 	if c.shouldReconnect(err) {
 		c.reconnect()
@@ -407,17 +557,25 @@ func (c *WSClient) reconnect() {
 	c.setState(StateReconnecting)
 	logger.Logrus().Warningln("starting websocket reconnection process")
 
+	c.workerWg.Add(1)
 	go func() {
+		defer c.workerWg.Done()
 		backoffDelay := c.reconnectInterval
 		maxBackoff := time.Minute * 2
 
 		for attempt := 1; attempt <= c.maxReconnectAttempts; attempt++ {
+			// 检查context是否已取消
+			if c.ctx.Err() != nil {
+				logger.Logrus().Warningln("reconnect cancelled: context cancelled")
+				return
+			}
+
 			if c.GetState() == StateClosed {
 				logger.Logrus().Warningln("reconnect cancelled: client closed")
 				return
 			}
 
-			logger.Logrus().Warningln("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
+			logger.Logrus().Warningf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
 
 			// 确保旧连接完全关闭
 			c.stateMux.Lock()
@@ -429,10 +587,11 @@ func (c *WSClient) reconnect() {
 
 			// 等待一段时间再重连，使用指数退避
 			if attempt > 1 {
-				logger.Logrus().Warningln("waiting %v before reconnect attempt %d", backoffDelay, attempt)
+				logger.Logrus().Warningf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
 				select {
 				case <-time.After(backoffDelay):
 				case <-c.ctx.Done():
+					logger.Logrus().Warningln("reconnect cancelled: context cancelled during backoff")
 					return
 				}
 
@@ -451,7 +610,6 @@ func (c *WSClient) reconnect() {
 
 			// 重连成功
 			c.setState(StateConnected)
-
 			// 重新启动消息处理和心跳
 			c.startMessageHandlers()
 			c.startHeartbeat()
@@ -471,6 +629,7 @@ func (c *WSClient) reconnect() {
 		if c.onError != nil {
 			c.onError(errors.New("reconnection failed after all attempts"))
 		}
+		_ = c.Close()
 	}()
 }
 
@@ -478,19 +637,42 @@ func (c *WSClient) reconnect() {
 func (c *WSClient) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		logger.Logrus().Traceln("initiating websocket client close")
 		c.setState(StateClosed)
 		c.stopHeartbeat()
-
+		// 关闭WebSocket连接
 		c.stateMux.Lock()
 		if c.conn != nil {
 			err = c.conn.Close(websocket.StatusNormalClosure, "client closing")
+			c.conn = nil
 		}
 		c.stateMux.Unlock()
+		// 取消context，通知所有协程退出
 		c.cancel()
+		// 等待所有工作协程完成
+		done := make(chan struct{})
+		go func() {
+			c.workerWg.Wait()
+			close(done)
+		}()
+
+		// 等待所有协程退出，但设置超时防止死锁
+		select {
+		case <-done:
+			logger.Logrus().Traceln("all worker goroutines exited")
+		case <-time.After(time.Second * 5):
+			logger.Logrus().Warningln("timeout waiting for worker goroutines to exit")
+		}
+
 		// 关闭通道
 		close(c.receiveChan)
 		close(c.sendChan)
-		logger.Logrus().Traceln("websocket client closed")
+
+		// 调用断开连接回调
+		if c.onDisconnect != nil {
+			c.onDisconnect(errors.New("client closed"))
+		}
+		logger.Logrus().Traceln("websocket client closed successfully")
 	})
 	return err
 }
