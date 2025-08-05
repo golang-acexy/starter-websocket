@@ -20,6 +20,9 @@ func TestClient(t *testing.T) {
 		OnDisconnect: func(err error) {
 			t.Log("disconnect", err)
 		},
+		OnClose: func(err error) {
+			cancel()
+		},
 	})
 	client.SetHeartbeat(time.Second*30, "ping", "pong")
 	chn, err := client.Connect()

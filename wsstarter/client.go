@@ -72,6 +72,7 @@ type WSClient struct {
 	onConnect    func()
 	onDisconnect func(error)
 	onError      func(error)
+	onClose      func(error) // 客户端关闭时
 
 	// 优雅关闭
 	closeOnce sync.Once
@@ -101,6 +102,7 @@ type WSClientConfig struct {
 	OnConnect    func()
 	OnDisconnect func(error)
 	OnError      func(error)
+	OnClose      func(error) // 新增：客户端关闭时的一次性回调，保证只调用一次
 }
 
 func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
@@ -137,6 +139,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		onConnect:                config.OnConnect,
 		onDisconnect:             config.OnDisconnect,
 		onError:                  config.OnError,
+		onClose:                  config.OnClose, // 新增
 		showHeartbeatTraceLogger: config.ShowHeartbeatTraceLogger,
 		blockReceive:             config.BlockReceive,
 		blockSender:              config.BlockSender,
@@ -203,8 +206,8 @@ func (c *WSClient) startHeartbeat() {
 	heartbeatCtx, cancel := context.WithCancel(c.ctx)
 	c.heartbeatCancel = cancel
 
-	// 重置最后pong时间
-	c.lastPongTime.Store(time.Now())
+	// 使用channel来同步第一次心跳发送完成
+	firstHeartbeatSent := make(chan struct{})
 
 	// 心跳发送协程
 	c.workerWg.Add(1)
@@ -213,6 +216,51 @@ func (c *WSClient) startHeartbeat() {
 		ticker := time.NewTicker(c.heartbeatInterval)
 		defer ticker.Stop()
 
+		// 立即发送第一次心跳
+		if c.IsConnected() {
+			if c.heartbeatPingData != "" {
+				// 使用自定义心跳消息
+				err := c.Send(websocket.MessageText, []byte(c.heartbeatPingData))
+				if err != nil {
+					logger.Logrus().Debugf("send heartbeat ping failed: %v", err)
+					c.handleConnectionError(err)
+					close(firstHeartbeatSent) // 即使失败也要关闭channel
+					return
+				}
+				if c.showHeartbeatTraceLogger {
+					logger.Logrus().Traceln("first custom heartbeat ping sent")
+				}
+			} else {
+				// 使用WebSocket原生ping
+				c.stateMux.RLock()
+				conn := c.conn
+				c.stateMux.RUnlock()
+
+				if conn != nil {
+					pingCtx, pingCancel := context.WithTimeout(c.ctx, time.Second*5)
+					err := conn.Ping(pingCtx)
+					pingCancel()
+
+					if err != nil {
+						logger.Logrus().Debugf("first ping failed: %v", err)
+						c.handleConnectionError(err)
+						close(firstHeartbeatSent) // 即使失败也要关闭channel
+						return
+					} else {
+						// ping成功发送，更新时间（对于原生心跳，ping成功表示连接正常）
+						c.lastPongTime.Store(time.Now())
+						if c.showHeartbeatTraceLogger {
+							logger.Logrus().Traceln("first native ping sent successfully")
+						}
+					}
+				}
+			}
+		}
+
+		// 通知第一次心跳已发送
+		close(firstHeartbeatSent)
+
+		// 定期发送心跳
 		for {
 			select {
 			case <-ticker.C:
@@ -224,6 +272,9 @@ func (c *WSClient) startHeartbeat() {
 							logger.Logrus().Debugf("send heartbeat ping failed: %v", err)
 							c.handleConnectionError(err)
 							return
+						}
+						if c.showHeartbeatTraceLogger {
+							logger.Logrus().Traceln("custom heartbeat ping sent")
 						}
 					} else {
 						// 使用WebSocket原生ping
@@ -243,7 +294,9 @@ func (c *WSClient) startHeartbeat() {
 							} else {
 								// ping成功发送，更新时间（对于原生心跳，ping成功表示连接正常）
 								c.lastPongTime.Store(time.Now())
-								logger.Logrus().Traceln("native ping sent successfully")
+								if c.showHeartbeatTraceLogger {
+									logger.Logrus().Traceln("native ping sent successfully")
+								}
 							}
 						}
 					}
@@ -255,10 +308,45 @@ func (c *WSClient) startHeartbeat() {
 		}
 	}()
 
-	// 启动心跳超时检测协程（适用于所有心跳模式）
+	// 启动心跳超时检测协程（等待第一次心跳发送后再开始检测）
 	c.workerWg.Add(1)
 	go func() {
 		defer c.workerWg.Done()
+
+		// 等待第一次心跳发送完成
+		select {
+		case <-firstHeartbeatSent:
+			// 第一次心跳已发送，重置lastPongTime为当前时间作为基准
+			c.lastPongTime.Store(time.Now())
+			if c.showHeartbeatTraceLogger {
+				logger.Logrus().Traceln("heartbeat monitor starting after first heartbeat sent")
+			}
+		case <-heartbeatCtx.Done():
+			logger.Logrus().Traceln("websocket client heartbeat monitor exit before first heartbeat")
+			return
+		}
+
+		// 等待一个合理的时间后再开始检测，给心跳响应充足的时间
+		// 对于自定义心跳，需要等待pong响应；对于原生心跳，ping成功后就已经更新了时间
+		var initialDelay time.Duration
+		if c.heartbeatPingData != "" && c.heartbeatPongData != "" {
+			// 自定义心跳模式：等待heartbeatTimeout时间，给pong响应留出时间
+			initialDelay = c.heartbeatTimeout
+		} else {
+			// 原生心跳模式：等待一个心跳间隔，因为ping成功就已经更新了时间
+			initialDelay = c.heartbeatInterval
+		}
+
+		select {
+		case <-time.After(initialDelay):
+			if c.showHeartbeatTraceLogger {
+				logger.Logrus().Tracef("heartbeat timeout detection started after %v delay", initialDelay)
+			}
+		case <-heartbeatCtx.Done():
+			logger.Logrus().Traceln("websocket client heartbeat monitor exit during initial wait")
+			return
+		}
+
 		// 检测频率为心跳间隔的一半，但不超过30秒，不少于1秒
 		checkInterval := c.heartbeatInterval / 2
 		if checkInterval > time.Second*30 {
@@ -625,7 +713,7 @@ func (c *WSClient) reconnect() {
 			return
 		}
 
-		// 重连失败
+		// 重连失败，关闭客户端
 		logger.Logrus().Errorln("websocket reconnect failed after all attempts")
 		c.setState(StateDisconnected)
 
@@ -638,11 +726,17 @@ func (c *WSClient) reconnect() {
 
 // Close 关闭连接
 func (c *WSClient) Close() error {
+	return c.CloseWithError(errors.New("client closed"))
+}
+
+// CloseWithError 带错误信息的关闭连接
+func (c *WSClient) CloseWithError(closeErr error) error {
 	var err error
 	c.closeOnce.Do(func() {
 		logger.Logrus().Traceln("initiating websocket client close")
 		c.setState(StateClosed)
 		c.stopHeartbeat()
+
 		// 关闭WebSocket连接
 		c.stateMux.Lock()
 		if c.conn != nil {
@@ -650,8 +744,10 @@ func (c *WSClient) Close() error {
 			c.conn = nil
 		}
 		c.stateMux.Unlock()
+
 		// 取消context，通知所有协程退出
 		c.cancel()
+
 		// 等待所有工作协程完成
 		done := make(chan struct{})
 		go func() {
@@ -671,10 +767,16 @@ func (c *WSClient) Close() error {
 		close(c.receiveChan)
 		close(c.sendChan)
 
-		// 调用断开连接回调
+		// 先调用断开连接回调（可能会被多次调用）
 		if c.onDisconnect != nil {
-			c.onDisconnect(errors.New("client closed"))
+			c.onDisconnect(closeErr)
 		}
+
+		// 最后调用关闭回调（保证只调用一次）
+		if c.onClose != nil {
+			c.onClose(closeErr)
+		}
+
 		logger.Logrus().Traceln("websocket client closed successfully")
 	})
 	return err
