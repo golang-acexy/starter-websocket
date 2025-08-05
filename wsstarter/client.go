@@ -121,7 +121,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		config.SendChanBufferLen = 100
 	}
 	if config.HeartbeatTimeout == 0 {
-		config.HeartbeatTimeout = time.Second * 60 // 默认60秒心跳超时
+		config.HeartbeatTimeout = time.Second * 10 // 默认10秒心跳超时
 	}
 
 	client := &WSClient{
@@ -398,6 +398,9 @@ func (c *WSClient) startMessageHandlers() {
 				if c.heartbeatPongData != "" && messageType == websocket.MessageText && string(data) == c.heartbeatPongData {
 					// 更新最后收到pong的时间
 					c.lastPongTime.Store(time.Now())
+					if c.showHeartbeatTraceLogger {
+						logger.Logrus().Traceln("received custom heartbeat pong")
+					}
 					continue
 				}
 
