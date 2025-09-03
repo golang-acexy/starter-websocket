@@ -2,11 +2,12 @@ package test
 
 import (
 	"context"
+	"testing"
+	"time"
+
 	"github.com/acexy/golang-toolkit/logger"
 	"github.com/acexy/golang-toolkit/sys"
 	"github.com/golang-acexy/starter-websocket/wsstarter"
-	"testing"
-	"time"
 )
 
 func TestClient(t *testing.T) {
