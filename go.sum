@@ -1,9 +1,7 @@
-github.com/acexy/golang-toolkit v0.0.50 h1:vpcoo0Vs5fNBI/sa8nqcB9/zyyqWOcVq1mM8GpIP7AE=
-github.com/acexy/golang-toolkit v0.0.50/go.mod h1:tQ+ZRzl4bHPPz4HGTBq5jJRXceAUa7XS45zskTXBAVM=
-github.com/acexy/golang-toolkit v0.0.51 h1:GKzKdtsPn/06qFnAuVRI0RmtO2UAhmUTS694UVzIVH0=
-github.com/acexy/golang-toolkit v0.0.51/go.mod h1:cirwn7xm1gICDdUvSUBwz6snU1gP8HAsaruOLopSxIQ=
-github.com/coder/websocket v1.8.13 h1:f3QZdXy7uGVz+4uCJy2nTZyM0yTBj8yANEHhqlXZ9FE=
-github.com/coder/websocket v1.8.13/go.mod h1:LNVeNrXQZfe5qhS9ALED3uA+l5pPqvwXg3CKoDBB2gs=
+github.com/acexy/golang-toolkit v0.0.52 h1:YuvVqCxB1e6sxpbw/2L5SLdySDWferrdTfw2+NhkI0M=
+github.com/acexy/golang-toolkit v0.0.52/go.mod h1:cirwn7xm1gICDdUvSUBwz6snU1gP8HAsaruOLopSxIQ=
+github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
+github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

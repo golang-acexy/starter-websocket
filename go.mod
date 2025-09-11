@@ -3,8 +3,8 @@ module github.com/golang-acexy/starter-websocket
 go 1.23.5
 
 require (
-	github.com/acexy/golang-toolkit v0.0.51
-	github.com/coder/websocket v1.8.13
+	github.com/acexy/golang-toolkit v0.0.52
+	github.com/coder/websocket v1.8.14
 )
 
 require (
