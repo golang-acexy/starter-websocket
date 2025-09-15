@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,11 +38,12 @@ const (
 )
 
 type WSClient struct {
-	url    string
-	conn   *websocket.Conn
-	cancel context.CancelFunc
-	ctx    context.Context
-	opts   *websocket.DialOptions
+	url       string
+	httpProxy string
+	conn      *websocket.Conn
+	cancel    context.CancelFunc
+	ctx       context.Context
+	opts      *websocket.DialOptions
 
 	// 连接状态管理
 	state    atomic.Value // ConnectionState
@@ -69,10 +72,10 @@ type WSClient struct {
 	sendMux     sync.Mutex
 
 	// 回调函数
-	onConnect    func()
-	onDisconnect func(error)
-	onError      func(error)
-	onClose      func(error) // 客户端关闭时的一次性回调
+	onConnected    func()
+	onDisconnected func(error)
+	onError        func(error)
+	onClosed       func(error) // 客户端关闭时的一次性回调
 
 	// 优雅关闭
 	closeOnce sync.Once
@@ -84,6 +87,7 @@ type WSClient struct {
 // WSClientConfig 配置结构
 type WSClientConfig struct {
 	URL                  string
+	HttpProxyURL         string
 	DialOptions          *websocket.DialOptions
 	MaxReconnectAttempts int
 	ReconnectInterval    time.Duration
@@ -99,10 +103,10 @@ type WSClientConfig struct {
 	ShowHeartbeatTraceLogger bool
 
 	// 回调函数
-	OnConnect    func()
-	OnDisconnect func(error)
-	OnError      func(error)
-	OnClose      func(error) // 新增：客户端关闭时的一次性回调，保证只调用一次
+	OnConnected    func()
+	OnDisconnected func(error)
+	OnError        func(error)
+	OnClosed       func(error) // 新增：客户端关闭时的一次性回调，保证只调用一次
 }
 
 func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
@@ -125,33 +129,30 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	if config.HeartbeatTimeout == 0 {
 		config.HeartbeatTimeout = time.Second * 60 // 默认60秒心跳超时
 	}
-
 	client := &WSClient{
 		ctx:                      ctx,
 		cancel:                   cancel,
 		url:                      config.URL,
+		httpProxy:                config.HttpProxyURL,
 		opts:                     config.DialOptions,
 		maxReconnectAttempts:     config.MaxReconnectAttempts,
 		reconnectInterval:        config.ReconnectInterval,
 		heartbeatTimeout:         config.HeartbeatTimeout,
 		receiveChan:              make(chan *WSData, config.ChanBufferLen),
 		sendChan:                 make(chan *WSData, config.SendChanBufferLen),
-		onConnect:                config.OnConnect,
-		onDisconnect:             config.OnDisconnect,
+		onConnected:              config.OnConnected,
+		onDisconnected:           config.OnDisconnected,
 		onError:                  config.OnError,
-		onClose:                  config.OnClose, // 新增
+		onClosed:                 config.OnClosed, // 新增
 		showHeartbeatTraceLogger: config.ShowHeartbeatTraceLogger,
 		blockReceive:             config.BlockReceive,
 		blockSender:              config.BlockSender,
 	}
-
 	client.setState(StateDisconnected)
 	client.lastPongTime.Store(time.Now())
-
 	// 启动context监听协程，当context取消时执行优雅关闭
 	client.workerWg.Add(1)
 	go client.contextMonitor()
-
 	return client
 }
 
@@ -281,7 +282,6 @@ func (c *WSClient) startHeartbeat() {
 						c.stateMux.RLock()
 						conn := c.conn
 						c.stateMux.RUnlock()
-
 						if conn != nil {
 							pingCtx, pingCancel := context.WithTimeout(c.ctx, time.Second*5)
 							err := conn.Ping(pingCtx)
@@ -312,7 +312,6 @@ func (c *WSClient) startHeartbeat() {
 	c.workerWg.Add(1)
 	go func() {
 		defer c.workerWg.Done()
-
 		// 等待第一次心跳发送完成
 		select {
 		case <-firstHeartbeatSent:
@@ -323,7 +322,6 @@ func (c *WSClient) startHeartbeat() {
 			logger.Logrus().Traceln("websocket client heartbeat monitor exit before first heartbeat")
 			return
 		}
-
 		// 等待一个合理的时间后再开始检测，给心跳响应充足的时间
 		// 对于自定义心跳，需要等待pong响应；对于原生心跳，ping成功后就已经更新了时间
 		var initialDelay time.Duration
@@ -356,10 +354,8 @@ func (c *WSClient) startHeartbeat() {
 		if checkInterval < time.Second {
 			checkInterval = time.Second
 		}
-
 		ticker := time.NewTicker(checkInterval)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
@@ -413,8 +409,8 @@ func (c *WSClient) Connect() (<-chan *WSData, error) {
 	// 启动心跳
 	c.startHeartbeat()
 	c.setState(StateConnected)
-	if c.onConnect != nil {
-		c.onConnect()
+	if c.onConnected != nil {
+		c.onConnected()
 	}
 	logger.Logrus().Traceln("websocket client connected successfully")
 	return c.receiveChan, nil
@@ -422,6 +418,19 @@ func (c *WSClient) Connect() (<-chan *WSData, error) {
 
 // dial 建立 WebSocket 连接
 func (c *WSClient) dial() error {
+	if c.httpProxy != "" {
+		proxyURL, err := url.Parse(c.httpProxy)
+		if err != nil {
+			return fmt.Errorf("invalid proxy address: %w", err)
+		}
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
+		if c.opts == nil {
+			c.opts = &websocket.DialOptions{}
+		}
+		c.opts.HTTPClient = &http.Client{Transport: transport}
+	}
 	conn, _, err := websocket.Dial(c.ctx, c.url, c.opts)
 	if err != nil {
 		return err
@@ -618,8 +627,8 @@ func (c *WSClient) handleConnectionError(err error) {
 	logger.Logrus().Debugf("websocket connection error: %v", err)
 
 	// 调用断开连接回调
-	if c.onDisconnect != nil {
-		c.onDisconnect(err)
+	if c.onDisconnected != nil {
+		c.onDisconnected(err)
 	}
 
 	// 判断是否需要重连
@@ -706,8 +715,8 @@ func (c *WSClient) reconnect() {
 			c.startMessageHandlers()
 			c.startHeartbeat()
 
-			if c.onConnect != nil {
-				c.onConnect()
+			if c.onConnected != nil {
+				c.onConnected()
 			}
 
 			logger.Logrus().Infoln("websocket reconnect successful")
@@ -727,7 +736,7 @@ func (c *WSClient) reconnect() {
 
 // Close 关闭连接
 func (c *WSClient) Close() error {
-	return c.CloseWithError(errors.New("client closed"))
+	return c.CloseWithError(nil)
 }
 
 // CloseWithError 带错误信息的关闭连接
@@ -769,15 +778,14 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		close(c.sendChan)
 
 		// 先调用断开连接回调（可能会被多次调用）
-		if c.onDisconnect != nil {
-			c.onDisconnect(closeErr)
+		if c.onDisconnected != nil {
+			c.onDisconnected(closeErr)
 		}
 
 		// 最后调用关闭回调（保证只调用一次）
-		if c.onClose != nil {
-			c.onClose(closeErr)
+		if c.onClosed != nil {
+			c.onClosed(closeErr)
 		}
-
 		logger.Logrus().Traceln("websocket client closed successfully")
 	})
 	return err

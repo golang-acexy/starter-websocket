@@ -3,7 +3,6 @@ package test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/acexy/golang-toolkit/logger"
 	"github.com/acexy/golang-toolkit/sys"
@@ -14,19 +13,20 @@ func TestClient(t *testing.T) {
 	logger.EnableConsole(logger.TraceLevel, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL: "https://",
-		OnConnect: func() {
-			t.Log("connect")
+		URL:          "wss://",
+		HttpProxyURL: "http://localhost:7890",
+		OnConnected: func() {
+			logger.Logrus().Infoln("ws connected")
 		},
-		OnDisconnect: func(err error) {
-			t.Log("disconnect", err)
+		OnDisconnected: func(err error) {
+			logger.Logrus().Infoln("ws disconnected", err)
 		},
-		OnClose: func(err error) {
+		OnClosed: func(err error) {
 			cancel()
 		},
 	})
-	client.SetHeartbeat(time.Second*30, "ping", "pong")
-	chn, err := client.Connect()
+	//client.SetHeartbeat(time.Second*30, "ping", "pong")
+	dataChn, err := client.Connect()
 	if err != nil {
 		t.Error(err)
 		cancel()
@@ -35,7 +35,8 @@ func TestClient(t *testing.T) {
 	go func() {
 		for {
 			select {
-			case _ = <-chn:
+			case d := <-dataChn:
+				logger.Logrus().Debugln(d.ToString())
 			case <-ctx.Done():
 				return
 			}
@@ -43,5 +44,5 @@ func TestClient(t *testing.T) {
 	}()
 	sys.ShutdownHolding()
 	cancel()
-	_ = client.Close()
+	client.Close()
 }
