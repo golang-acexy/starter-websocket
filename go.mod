@@ -1,6 +1,6 @@
 module github.com/golang-acexy/starter-websocket
 
-go 1.23.5
+go 1.24.6
 
 require (
 	github.com/acexy/golang-toolkit v0.0.52

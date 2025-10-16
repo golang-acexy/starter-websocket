@@ -62,6 +62,8 @@ type WSClient struct {
 	showHeartbeatTraceLogger bool
 	lastPongTime             atomic.Value // time.Time - 最后收到pong的时间
 
+	readLimit int64
+
 	// 数据通道
 	blockReceive bool
 	receiveChan  chan *WSData
@@ -94,6 +96,7 @@ type WSClientConfig struct {
 	ChanBufferLen        int
 	WorkerCount          int
 	SendChanBufferLen    int
+	ReadLimit            int64
 
 	BlockReceive bool // 阻塞式接收数据
 	BlockSender  bool // 阻塞式发送数据
@@ -147,6 +150,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		showHeartbeatTraceLogger: config.ShowHeartbeatTraceLogger,
 		blockReceive:             config.BlockReceive,
 		blockSender:              config.BlockSender,
+		readLimit:                config.ReadLimit,
 	}
 	client.setState(StateDisconnected)
 	client.lastPongTime.Store(time.Now())
@@ -434,6 +438,9 @@ func (c *WSClient) dial() error {
 	conn, _, err := websocket.Dial(c.ctx, c.url, c.opts)
 	if err != nil {
 		return err
+	}
+	if c.readLimit > 0 {
+		conn.SetReadLimit(c.readLimit)
 	}
 	c.stateMux.Lock()
 	c.conn = conn
