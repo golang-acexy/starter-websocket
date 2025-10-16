@@ -223,7 +223,7 @@ func (c *WSClient) startHeartbeat() {
 				// 使用自定义心跳消息
 				err := c.Send(websocket.MessageText, []byte(c.heartbeatPingData))
 				if err != nil {
-					logger.Logrus().Debugf("send heartbeat ping failed: %v", err)
+					logger.Logrus().Warningf("send heartbeat ping failed: %v", err)
 					c.handleConnectionError(err)
 					close(firstHeartbeatSent) // 即使失败也要关闭channel
 					return
@@ -243,7 +243,7 @@ func (c *WSClient) startHeartbeat() {
 					pingCancel()
 
 					if err != nil {
-						logger.Logrus().Debugf("first ping failed: %v", err)
+						logger.Logrus().Tracef("first ping failed: %v", err)
 						c.handleConnectionError(err)
 						close(firstHeartbeatSent) // 即使失败也要关闭channel
 						return
@@ -270,7 +270,7 @@ func (c *WSClient) startHeartbeat() {
 						// 使用自定义心跳消息
 						err := c.Send(websocket.MessageText, []byte(c.heartbeatPingData))
 						if err != nil {
-							logger.Logrus().Debugf("send heartbeat ping failed: %v", err)
+							logger.Logrus().Tracef("send heartbeat ping failed: %v", err)
 							c.handleConnectionError(err)
 							return
 						}
@@ -288,7 +288,7 @@ func (c *WSClient) startHeartbeat() {
 							pingCancel()
 
 							if err != nil {
-								logger.Logrus().Debugf("ping failed: %v", err)
+								logger.Logrus().Tracef("ping failed: %v", err)
 								c.handleConnectionError(err)
 								return
 							} else {
@@ -456,7 +456,7 @@ func (c *WSClient) startMessageHandlers() {
 		for {
 			select {
 			case <-c.ctx.Done():
-				logger.Logrus().Traceln("websocket client message handler exit due to context cancellation")
+				logger.Logrus().Warningln("websocket client message handler exit due to context cancellation")
 				return
 			default:
 				state := c.GetState()
@@ -473,7 +473,7 @@ func (c *WSClient) startMessageHandlers() {
 				c.stateMux.RUnlock()
 
 				if conn == nil {
-					logger.Logrus().Debugln("connection is nil, triggering reconnect")
+					logger.Logrus().Warningln("connection is nil, triggering reconnect")
 					c.handleConnectionError(errors.New("connection is nil"))
 					return
 				}
@@ -484,10 +484,10 @@ func (c *WSClient) startMessageHandlers() {
 				if err != nil {
 					// 检查是否是context取消导致的错误
 					if c.ctx.Err() != nil {
-						logger.Logrus().Traceln("websocket read interrupted by context cancellation")
+						logger.Logrus().Warningln("websocket read interrupted by context cancellation")
 						return
 					}
-					logger.Logrus().Debugf("websocket read error: %v", err)
+					logger.Logrus().Errorf("websocket read error: %v", err)
 					c.handleConnectionError(err)
 					return
 				}
@@ -562,7 +562,7 @@ func (c *WSClient) startSender() {
 						logger.Logrus().Traceln("websocket write interrupted by context cancellation")
 						return
 					}
-					logger.Logrus().Debugf("websocket write error: %v", err)
+					logger.Logrus().Warningf("websocket write error: %v", err)
 					if c.onError != nil {
 						c.onError(err)
 					}
@@ -624,7 +624,7 @@ func (c *WSClient) handleConnectionError(err error) {
 	if currentState == StateClosed || currentState == StateReconnecting {
 		return
 	}
-	logger.Logrus().Debugf("websocket connection error: %v", err)
+	logger.Logrus().Warningf("websocket connection error: %v", err)
 
 	// 调用断开连接回调
 	if c.onDisconnected != nil {
@@ -705,7 +705,7 @@ func (c *WSClient) reconnect() {
 
 			// 尝试重新建立连接
 			if err := c.dial(); err != nil {
-				logger.Logrus().Debugf("reconnect attempt %d failed: %v", attempt, err)
+				logger.Logrus().Warningln("reconnect attempt %d failed: %v", attempt, err)
 				continue
 			}
 
@@ -719,7 +719,7 @@ func (c *WSClient) reconnect() {
 				c.onConnected()
 			}
 
-			logger.Logrus().Infoln("websocket reconnect successful")
+			logger.Logrus().Traceln("websocket reconnect successful")
 			return
 		}
 
@@ -743,14 +743,14 @@ func (c *WSClient) Close() error {
 func (c *WSClient) CloseWithError(closeErr error) error {
 	var err error
 	c.closeOnce.Do(func() {
-		logger.Logrus().Traceln("initiating websocket client close")
+		logger.Logrus().Traceln("close websocket client ...")
 		c.setState(StateClosed)
 		c.stopHeartbeat()
 
 		// 关闭WebSocket连接
 		c.stateMux.Lock()
 		if c.conn != nil {
-			err = c.conn.Close(websocket.StatusNormalClosure, "client closing")
+			err = c.conn.Close(websocket.StatusNormalClosure, "client closed")
 			c.conn = nil
 		}
 		c.stateMux.Unlock()
