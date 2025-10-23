@@ -2,6 +2,8 @@ package test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/acexy/golang-toolkit/logger"
@@ -13,7 +15,7 @@ func TestClient(t *testing.T) {
 	logger.EnableConsole(logger.TraceLevel, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL:          "wss://",
+		URL:          "wss://fstream.binance.com/ws/btcusdt@markPrice@1s",
 		HttpProxyURL: "http://localhost:7890",
 		OnConnected: func() {
 			logger.Logrus().Infoln("ws connected")
@@ -22,7 +24,7 @@ func TestClient(t *testing.T) {
 			logger.Logrus().Infoln("ws disconnected", err)
 		},
 		OnClosed: func(err error) {
-			cancel()
+			logger.Logrus().Infoln("ws closed")
 		},
 	})
 	//client.SetHeartbeat(time.Second*30, "ping", "pong")
@@ -32,17 +34,17 @@ func TestClient(t *testing.T) {
 		cancel()
 		return
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		for {
-			select {
-			case d := <-dataChn:
-				logger.Logrus().Debugln(d.ToString())
-			case <-ctx.Done():
-				return
-			}
+		defer wg.Done()
+		for v := range dataChn {
+			fmt.Println(v)
 		}
 	}()
 	sys.ShutdownHolding()
 	cancel()
-	client.Close()
+
+	//client.Close()
+	wg.Wait()
 }
