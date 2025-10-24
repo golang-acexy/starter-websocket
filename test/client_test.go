@@ -27,7 +27,6 @@ func TestClient(t *testing.T) {
 			logger.Logrus().Infoln("ws closed")
 		},
 	})
-	//client.SetHeartbeat(time.Second*30, "ping", "pong")
 	dataChn, err := client.Connect()
 	if err != nil {
 		t.Error(err)
@@ -44,7 +43,6 @@ func TestClient(t *testing.T) {
 	}()
 	sys.ShutdownHolding()
 	cancel()
-
 	//client.Close()
-	wg.Wait()
+	//wg.Wait()
 }
