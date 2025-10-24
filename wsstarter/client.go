@@ -210,10 +210,8 @@ func (c *WSClient) startHeartbeat() {
 	c.stopHeartbeat()
 	heartbeatCtx, cancel := context.WithCancel(c.ctx)
 	c.heartbeatCancel = cancel
-
 	// 使用channel来同步第一次心跳发送完成
 	firstHeartbeatSent := make(chan struct{})
-
 	// 心跳发送协程
 	c.workerWg.Add(1)
 	go func() {
@@ -451,8 +449,12 @@ func (c *WSClient) dial() error {
 // startMessageHandlers 启动消息处理协程
 func (c *WSClient) startMessageHandlers() {
 	c.workerWg.Add(1)
+	logger.Logrus().Traceln("starting websocket message handler")
 	go func() {
-		defer c.workerWg.Done()
+		defer func() {
+			c.workerWg.Done()
+			logger.Logrus().Traceln("websocket message handler exit")
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Logrus().Errorf("websocket message handler panic: %v", r)
