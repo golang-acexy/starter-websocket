@@ -135,16 +135,16 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	}
 	client.setState(StateWaitToConnect)
 	// 启动context监听协程，当context取消时执行优雅关闭
-	client.workerWg.Add(1)
 	go client.contextMonitor()
 	return client
 }
 
 // contextMonitor 监听context取消事件，执行优雅关闭
 func (c *WSClient) contextMonitor() {
-	defer c.workerWg.Done()
+	c.workerWg.Add(1)
 	<-c.ctx.Done()
 	logger.Logrus().Traceln("context cancelled, initiating graceful shutdown")
+	c.workerWg.Done()
 	_ = c.Close()
 }
 
@@ -219,6 +219,7 @@ func (c *WSClient) startMessageHandler() {
 	c.workerWg.Add(1)
 	go func() {
 		defer func() {
+			logger.Logrus().Traceln("websocket message handler exit")
 			c.workerWg.Done()
 		}()
 		defer func() {
@@ -288,7 +289,10 @@ func (c *WSClient) startMessageHandler() {
 func (c *WSClient) startMessageSender() {
 	c.workerWg.Add(1)
 	go func() {
-		defer c.workerWg.Done()
+		defer func() {
+			c.workerWg.Done()
+			logger.Logrus().Traceln("websocket message sender exit")
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Logrus().Errorf("websocket sender panic: %v", r)
@@ -303,7 +307,6 @@ func (c *WSClient) startMessageSender() {
 					logger.Logrus().Warningln("not connected, dropping message")
 					continue
 				}
-
 				c.stateMux.RLock()
 				conn := c.conn
 				c.stateMux.RUnlock()
@@ -343,7 +346,6 @@ func (c *WSClient) Send(messageType websocket.MessageType, data []byte) error {
 	if !c.IsConnected() {
 		return errors.New("client is not connected")
 	}
-
 	if c.blockSender {
 		select {
 		case c.sendChan <- &WSData{Type: messageType, Data: data}:
@@ -524,6 +526,7 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		done := make(chan struct{})
 		go func() {
 			c.workerWg.Wait()
+			logger.Logrus().Traceln("all worker goroutines exited")
 			close(done)
 		}()
 

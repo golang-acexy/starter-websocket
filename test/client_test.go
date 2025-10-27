@@ -14,6 +14,7 @@ import (
 func TestClient(t *testing.T) {
 	logger.EnableConsole(logger.TraceLevel, false)
 	ctx, cancel := context.WithCancel(context.Background())
+	d := make(chan struct{})
 	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
 		URL:          "wss://fstream.binance.com/ws/btcusdt@markPrice@1s",
 		HttpProxyURL: "http://localhost:7890",
@@ -25,6 +26,7 @@ func TestClient(t *testing.T) {
 		},
 		OnClosed: func(err error) {
 			logger.Logrus().Infoln("ws closed")
+			d <- struct{}{}
 		},
 	})
 	dataChn, err := client.Connect()
@@ -41,8 +43,13 @@ func TestClient(t *testing.T) {
 			fmt.Println(v)
 		}
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-d
+	}()
 	sys.ShutdownHolding()
 	cancel()
 	//client.Close()
-	//wg.Wait()
+	wg.Wait()
 }
