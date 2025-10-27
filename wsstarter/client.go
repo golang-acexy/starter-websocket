@@ -87,7 +87,7 @@ type WSClientConfig struct {
 	DialOptions          *websocket.DialOptions
 	MaxReconnectAttempts int
 	ReconnectInterval    time.Duration
-	ChanBufferLen        int   // 接收数据通道缓冲长度 非阻塞式模式生效 默认 500
+	ReceiveChanBufferLen int   // 接收数据通道缓冲长度 非阻塞式模式生效 默认 500
 	SendChanBufferLen    int   // 发送数据通道缓冲长度 非阻塞式模式生效 默认 500
 	ReadMaxBytesLimit    int64 // 接收数据最大字节数限制
 
@@ -109,8 +109,8 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	if config.ReconnectInterval == 0 {
 		config.ReconnectInterval = time.Second * 2
 	}
-	if config.ChanBufferLen <= 0 {
-		config.ChanBufferLen = defaultDataChanLength
+	if config.ReceiveChanBufferLen <= 0 {
+		config.ReceiveChanBufferLen = defaultDataChanLength
 	}
 	if config.SendChanBufferLen <= 0 {
 		config.SendChanBufferLen = defaultDataChanLength
@@ -123,7 +123,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		opts:                 config.DialOptions,
 		maxReconnectAttempts: config.MaxReconnectAttempts,
 		reconnectInterval:    config.ReconnectInterval,
-		receiveChan:          make(chan *WSData, config.ChanBufferLen),
+		receiveChan:          make(chan *WSData, config.ReceiveChanBufferLen),
 		sendChan:             make(chan *WSData, config.SendChanBufferLen),
 		onConnected:          config.OnConnected,
 		onDisconnected:       config.OnDisconnected,
