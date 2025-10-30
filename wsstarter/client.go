@@ -277,7 +277,7 @@ func (c *WSClient) startMessageHandler() {
 					case <-c.ctx.Done():
 						return
 					default:
-						logger.Logrus().Warnln("websocket receive data channel is full, dropping message")
+						logger.Logrus().Warnln("websocket receive data channel is full, dropping message", c.url)
 					}
 				}
 			}
