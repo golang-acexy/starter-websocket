@@ -299,7 +299,6 @@ func (c *WSClient) startMessageSender() {
 				c.handleConnectionError(fmt.Errorf("sender panic: %v", r))
 			}
 		}()
-
 		for {
 			select {
 			case data := <-c.sendChan:
@@ -379,7 +378,7 @@ func (c *WSClient) SendBinary(data []byte) error {
 func (c *WSClient) handleConnectionError(err error) {
 	// 检查是否是context取消导致的错误
 	if c.ctx.Err() != nil {
-		logger.Logrus().Traceln("connection error ignored due to context cancellation")
+		logger.Logrus().Warningln("connection error ignored due to context cancellation")
 		return
 	}
 
@@ -419,28 +418,24 @@ func (c *WSClient) reconnect() {
 	}
 
 	c.setState(StateReconnecting)
-	logger.Logrus().Warningln("starting websocket reconnection process")
+	logger.Logrus().Debugln("starting websocket reconnection process")
 
 	c.workerWg.Add(1)
 	go func() {
 		defer c.workerWg.Done()
 		backoffDelay := c.reconnectInterval
 		maxBackoff := time.Minute * 2
-
 		for attempt := 1; attempt <= c.maxReconnectAttempts; attempt++ {
 			// 检查context是否已取消
 			if c.ctx.Err() != nil {
 				logger.Logrus().Warningln("reconnect cancelled: context cancelled")
 				return
 			}
-
 			if c.GetState() == StateClosed {
 				logger.Logrus().Warningln("reconnect cancelled: client closed")
 				return
 			}
-
-			logger.Logrus().Warningf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
-
+			logger.Logrus().Debugf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
 			// 确保旧连接完全关闭
 			c.stateMux.Lock()
 			if c.conn != nil {
@@ -451,14 +446,13 @@ func (c *WSClient) reconnect() {
 
 			// 等待一段时间再重连，使用指数退避
 			if attempt > 1 {
-				logger.Logrus().Warningf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
+				logger.Logrus().Debugf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
 				select {
 				case <-time.After(backoffDelay):
 				case <-c.ctx.Done():
 					logger.Logrus().Warningln("reconnect cancelled: context cancelled during backoff")
 					return
 				}
-
 				// 指数退避，但不超过最大值
 				backoffDelay *= 2
 				if backoffDelay > maxBackoff {
@@ -471,24 +465,20 @@ func (c *WSClient) reconnect() {
 				logger.Logrus().Warningln("reconnect attempt %d failed: %v", attempt, err)
 				continue
 			}
-
+			logger.Logrus().Debugf("websocket reconnect successful")
 			// 重连成功
 			c.setState(StateConnected)
 			// 重新启动消息处理和心跳
 			c.startMessageHandler()
-
 			if c.onConnected != nil {
 				c.onConnected()
 			}
-
-			logger.Logrus().Traceln("websocket reconnect successful")
 			return
 		}
 
 		// 重连失败，关闭客户端
-		logger.Logrus().Errorln("websocket reconnect failed after all attempts")
+		logger.Logrus().Warningln("websocket reconnect failed after all attempts")
 		c.setState(StateDisconnected)
-
 		if c.onError != nil {
 			c.onError(errors.New("reconnection failed after all attempts"))
 		}
