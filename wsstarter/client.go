@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/acexy/golang-toolkit/logger"
+	"github.com/acexy/golang-toolkit/util/str"
 	"github.com/coder/websocket"
 )
 
@@ -206,23 +207,27 @@ func (c *WSClient) dial() error {
 		var err error
 		if c.httpProxyFn != nil {
 			proxyUrl := c.httpProxyFn()
-			proxyURL, err = url.Parse(proxyUrl)
-			if err != nil {
-				return fmt.Errorf("invalid proxy address: %s %w", proxyUrl, err)
+			if !str.HasText(proxyUrl) {
+				proxyURL, err = url.Parse(proxyUrl)
+				if err != nil {
+					return fmt.Errorf("invalid proxy address: %s %w", proxyUrl, err)
+				}
 			}
 		} else if c.httpProxy != "" {
 			proxyURL, err = url.Parse(c.httpProxy)
 			if err != nil {
-				return fmt.Errorf("invalid proxy address: %w", err)
+				return fmt.Errorf("invalid proxy address: %s %w", c.httpProxy, err)
 			}
 		}
-		transport := &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
+		if proxyURL != nil {
+			transport := &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+			}
+			if c.opts == nil {
+				c.opts = &websocket.DialOptions{}
+			}
+			c.opts.HTTPClient = &http.Client{Transport: transport}
 		}
-		if c.opts == nil {
-			c.opts = &websocket.DialOptions{}
-		}
-		c.opts.HTTPClient = &http.Client{Transport: transport}
 	}
 	conn, _, err := websocket.Dial(c.ctx, c.url, c.opts)
 	if err != nil {
