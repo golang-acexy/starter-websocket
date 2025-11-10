@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"sync"
@@ -55,6 +56,7 @@ type WSClient struct {
 	// 重连配置
 	maxReconnectAttempts int
 	reconnectInterval    time.Duration
+	forceReconnect       bool
 
 	readMaxBytesLimit int64
 
@@ -82,11 +84,14 @@ type WSClient struct {
 
 // WSClientConfig 配置结构
 type WSClientConfig struct {
-	URL                  string
-	HttpProxyURL         string
-	DialOptions          *websocket.DialOptions
+	URL          string
+	HttpProxyURL string
+	DialOptions  *websocket.DialOptions
+
+	ForceReconnect       bool // 是否强制重连 只要监测到连接状态异常，就会无限尝试重连
 	MaxReconnectAttempts int
 	ReconnectInterval    time.Duration
+
 	ReceiveChanBufferLen int   // 接收数据通道缓冲长度 非阻塞式模式生效 默认 500
 	SendChanBufferLen    int   // 发送数据通道缓冲长度 非阻塞式模式生效 默认 500
 	ReadMaxBytesLimit    int64 // 接收数据最大字节数限制
@@ -123,6 +128,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		opts:                 config.DialOptions,
 		maxReconnectAttempts: config.MaxReconnectAttempts,
 		reconnectInterval:    config.ReconnectInterval,
+		forceReconnect:       config.ForceReconnect,
 		receiveChan:          make(chan *WSData, config.ReceiveChanBufferLen),
 		sendChan:             make(chan *WSData, config.SendChanBufferLen),
 		onConnected:          config.OnConnected,
@@ -401,6 +407,9 @@ func (c *WSClient) handleConnectionError(err error) {
 
 // shouldReconnect 判断是否应该重连
 func (c *WSClient) shouldReconnect(err error) bool {
+	if c.forceReconnect {
+		return true
+	}
 	closeStatus := websocket.CloseStatus(err)
 	switch closeStatus {
 	case websocket.StatusNormalClosure, websocket.StatusGoingAway:
@@ -419,13 +428,18 @@ func (c *WSClient) reconnect() {
 
 	c.setState(StateReconnecting)
 	logger.Logrus().Debugln("starting websocket reconnection process")
-
 	c.workerWg.Add(1)
 	go func() {
 		defer c.workerWg.Done()
 		backoffDelay := c.reconnectInterval
-		maxBackoff := time.Minute * 2
-		for attempt := 1; attempt <= c.maxReconnectAttempts; attempt++ {
+		maxBackoff := time.Minute // 最大间隔不超过一分钟
+		var maxReconnectAttempts int
+		if c.forceReconnect {
+			maxReconnectAttempts = math.MaxInt
+		} else {
+			maxReconnectAttempts = c.maxReconnectAttempts
+		}
+		for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
 			// 检查context是否已取消
 			if c.ctx.Err() != nil {
 				logger.Logrus().Warningln("reconnect cancelled: context cancelled")
@@ -435,7 +449,11 @@ func (c *WSClient) reconnect() {
 				logger.Logrus().Warningln("reconnect cancelled: client closed")
 				return
 			}
-			logger.Logrus().Debugf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
+			if c.forceReconnect {
+				logger.Logrus().Debugf("websocket reconnect attempt: forced reconnect")
+			} else {
+				logger.Logrus().Debugf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
+			}
 			// 确保旧连接完全关闭
 			c.stateMux.Lock()
 			if c.conn != nil {
@@ -443,10 +461,14 @@ func (c *WSClient) reconnect() {
 				c.conn = nil
 			}
 			c.stateMux.Unlock()
-
 			// 等待一段时间再重连，使用指数退避
 			if attempt > 1 {
 				logger.Logrus().Debugf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
+				if c.forceReconnect {
+					logger.Logrus().Debugf("waiting %v before reconnect attempt: forced reconnect", backoffDelay)
+				} else {
+					logger.Logrus().Debugf("waiting %v before reconnect attempt: %d", backoffDelay, attempt)
+				}
 				select {
 				case <-time.After(backoffDelay):
 				case <-c.ctx.Done():
