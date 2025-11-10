@@ -42,12 +42,14 @@ const (
 )
 
 type WSClient struct {
-	url       string
-	httpProxy string
-	conn      *websocket.Conn
-	cancel    context.CancelFunc
-	ctx       context.Context
-	opts      *websocket.DialOptions
+	url string
+
+	httpProxyFn func() string
+	httpProxy   string
+	conn        *websocket.Conn
+	cancel      context.CancelFunc
+	ctx         context.Context
+	opts        *websocket.DialOptions
 
 	// 连接状态管理
 	state    atomic.Value // ConnectionState
@@ -85,9 +87,10 @@ type WSClient struct {
 
 // WSClientConfig 配置结构
 type WSClientConfig struct {
-	URL          string
-	HttpProxyURL string
-	DialOptions  *websocket.DialOptions
+	URL            string
+	HttpProxyURLFn func() string // 代理构造函数 权重高于HttpProxyURL
+	HttpProxyURL   string
+	DialOptions    *websocket.DialOptions
 
 	DisableReconnect     bool          // 禁用重连 (权重大于ForceReconnect)
 	ForceReconnect       bool          // 是否强制重连 只要监测到连接状态异常，就会无限尝试重连
@@ -127,6 +130,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		cancel:               cancel,
 		url:                  config.URL,
 		httpProxy:            config.HttpProxyURL,
+		httpProxyFn:          config.HttpProxyURLFn,
 		opts:                 config.DialOptions,
 		maxReconnectAttempts: config.MaxReconnectAttempts,
 		disableReconnect:     config.DisableReconnect,
@@ -197,10 +201,20 @@ func (c *WSClient) Connect() (<-chan *WSData, error) {
 
 // dial 建立 WebSocket 连接
 func (c *WSClient) dial() error {
-	if c.httpProxy != "" {
-		proxyURL, err := url.Parse(c.httpProxy)
-		if err != nil {
-			return fmt.Errorf("invalid proxy address: %w", err)
+	if c.httpProxyFn != nil || c.httpProxy != "" {
+		var proxyURL *url.URL
+		var err error
+		if c.httpProxyFn != nil {
+			proxyUrl := c.httpProxyFn()
+			proxyURL, err = url.Parse(proxyUrl)
+			if err != nil {
+				return fmt.Errorf("invalid proxy address: %s %w", proxyUrl, err)
+			}
+		} else if c.httpProxy != "" {
+			proxyURL, err = url.Parse(c.httpProxy)
+			if err != nil {
+				return fmt.Errorf("invalid proxy address: %w", err)
+			}
 		}
 		transport := &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
