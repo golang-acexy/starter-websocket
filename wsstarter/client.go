@@ -56,6 +56,7 @@ type WSClient struct {
 	// 重连配置
 	maxReconnectAttempts int
 	reconnectInterval    time.Duration
+	disableReconnect     bool
 	forceReconnect       bool
 
 	readMaxBytesLimit int64
@@ -88,9 +89,10 @@ type WSClientConfig struct {
 	HttpProxyURL string
 	DialOptions  *websocket.DialOptions
 
-	ForceReconnect       bool // 是否强制重连 只要监测到连接状态异常，就会无限尝试重连
-	MaxReconnectAttempts int
-	ReconnectInterval    time.Duration
+	DisableReconnect     bool          // 禁用重连 (权重大于ForceReconnect)
+	ForceReconnect       bool          // 是否强制重连 只要监测到连接状态异常，就会无限尝试重连
+	MaxReconnectAttempts int           // 默认重连3次
+	ReconnectInterval    time.Duration // 默认2秒，指数级自动增加等待时间最长1m
 
 	ReceiveChanBufferLen int   // 接收数据通道缓冲长度 非阻塞式模式生效 默认 500
 	SendChanBufferLen    int   // 发送数据通道缓冲长度 非阻塞式模式生效 默认 500
@@ -109,7 +111,7 @@ type WSClientConfig struct {
 func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	ctx, cancel := context.WithCancel(ctx)
 	if config.MaxReconnectAttempts == 0 {
-		config.MaxReconnectAttempts = 5
+		config.MaxReconnectAttempts = 3
 	}
 	if config.ReconnectInterval == 0 {
 		config.ReconnectInterval = time.Second * 2
@@ -127,6 +129,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		httpProxy:            config.HttpProxyURL,
 		opts:                 config.DialOptions,
 		maxReconnectAttempts: config.MaxReconnectAttempts,
+		disableReconnect:     config.DisableReconnect,
 		reconnectInterval:    config.ReconnectInterval,
 		forceReconnect:       config.ForceReconnect,
 		receiveChan:          make(chan *WSData, config.ReceiveChanBufferLen),
@@ -407,6 +410,9 @@ func (c *WSClient) handleConnectionError(err error) {
 
 // shouldReconnect 判断是否应该重连
 func (c *WSClient) shouldReconnect(err error) bool {
+	if c.disableReconnect {
+		return false
+	}
 	if c.forceReconnect {
 		return true
 	}
