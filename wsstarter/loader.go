@@ -14,13 +14,12 @@ import (
 
 var webSocketConfig *WebsocketConfig
 var server *http.Server
-var done chan struct{}
 
 type WebsocketConfig struct {
-	ListenAddress    string                   // ip:port
-	AcceptOptions    *websocket.AcceptOptions // websocket.AcceptOptions
-	GlobalIdentifier ConnIdentifier           // 全局连接标识符/鉴权操作 将覆盖未设置该行为的router
-	Routers          []*Router                // WS路由
+	ListenAddress        string                   // ip:port
+	AcceptOptions        *websocket.AcceptOptions // websocket.AcceptOptions
+	GlobalConnIdentifier ConnIdentifier           // 全局连接标识符/鉴权操作 将覆盖未设置该行为的router
+	Routers              []*Router                // WS路由
 }
 
 type WebsocketStarter struct {
@@ -59,7 +58,6 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 }
 
 func (w *WebsocketStarter) Start() (any, error) {
-	done = make(chan struct{})
 	config := w.getConfig()
 	if len(config.Routers) == 0 {
 		return nil, errors.New("miss routers")
@@ -73,13 +71,15 @@ func (w *WebsocketStarter) Start() (any, error) {
 			return false
 		}
 		muxSrv.Handle(router.Path, &handlerWrapper{
-			identifier: func() ConnIdentifier {
-				if config.GlobalIdentifier != nil && router.Identifier == nil {
-					return config.GlobalIdentifier
+			connIdentifier: func() ConnIdentifier {
+				if config.GlobalConnIdentifier != nil && router.ConnIdentifier == nil {
+					return config.GlobalConnIdentifier
 				}
-				return router.Identifier
+				return router.ConnIdentifier
 			}(),
-			handler: router.Handler,
+			handler:      router.Handler,
+			uniqueConnId: router.UniqueConnId,
+			allConn:      map[string]*Conn{},
 		})
 		return true
 	})
@@ -90,12 +90,23 @@ func (w *WebsocketStarter) Start() (any, error) {
 		listenAddr = ":8081"
 	}
 	server = &http.Server{
-		Addr:    ":8080",
+		Addr:    listenAddr,
 		Handler: muxSrv,
 	}
 
-	err = server.ListenAndServe()
-	return muxSrv, err
+	errChn := make(chan error)
+	go func() {
+		if err = server.ListenAndServe(); err != nil {
+			errChn <- err
+		}
+	}()
+
+	select {
+	case <-time.After(time.Second):
+		return server, nil
+	case err = <-errChn:
+		return server, err
+	}
 }
 
 func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped bool, err error) {
