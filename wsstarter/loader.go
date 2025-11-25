@@ -1,16 +1,20 @@
 package wsstarter
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
 
 	"github.com/acexy/golang-toolkit/util/coll"
+	"github.com/acexy/golang-toolkit/util/net"
 	"github.com/coder/websocket"
 	"github.com/golang-acexy/starter-parent/parent"
 )
 
 var webSocketConfig *WebsocketConfig
+var server *http.Server
+var done chan struct{}
 
 type WebsocketConfig struct {
 	ListenAddress    string                   // ip:port
@@ -55,6 +59,7 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 }
 
 func (w *WebsocketStarter) Start() (any, error) {
+	done = make(chan struct{})
 	config := w.getConfig()
 	if len(config.Routers) == 0 {
 		return nil, errors.New("miss routers")
@@ -84,11 +89,23 @@ func (w *WebsocketStarter) Start() (any, error) {
 	if listenAddr == "" {
 		listenAddr = ":8081"
 	}
-	err = http.ListenAndServe(listenAddr, muxSrv)
+	server = &http.Server{
+		Addr:    ":8080",
+		Handler: muxSrv,
+	}
+
+	err = server.ListenAndServe()
 	return muxSrv, err
 }
 
 func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped bool, err error) {
-	//TODO implement me
-	panic("implement me")
+	ctx, cancel := context.WithTimeout(context.Background(), maxWaitTime)
+	defer cancel()
+	if err = server.Shutdown(ctx); err != nil {
+		gracefully = false
+	} else {
+		gracefully = true
+	}
+	stopped = !net.Telnet(w.getConfig().ListenAddress, time.Second)
+	return
 }

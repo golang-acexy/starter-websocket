@@ -61,6 +61,7 @@ type handlerWrapper struct {
 
 type Conn struct {
 	ConnId  string
+	cancel  context.CancelFunc
 	conn    *websocket.Conn
 	request *http.Request
 }
@@ -75,13 +76,14 @@ func (c *Conn) SendMessageCtx(ctx context.Context, message Message) error {
 	return c.conn.Write(ctx, message.Type, message.Data)
 }
 
-// SendStreamMessage 创建一个流式数据发送器
-func (c *Conn) SendStreamMessage(ctx context.Context, messageType websocket.MessageType) (io.WriteCloser, error) {
-	return c.conn.Writer(ctx, messageType)
+// SendStreamTextMessage 创建一个流式数据发送器
+func (c *Conn) SendStreamTextMessage(ctx context.Context) (io.WriteCloser, error) {
+	return c.conn.Writer(ctx, websocket.MessageText)
 }
 
 func (c *Conn) Close() {
 	_ = c.conn.CloseNow()
+	c.cancel()
 }
 
 // Request 请求包裹
@@ -121,8 +123,11 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	ctx, cancel := context.WithCancel(request.Context())
-	defer func() {
+	go func() {
+		<-done
 		cancel()
+	}()
+	defer func() {
 		_ = conn.CloseNow()
 	}()
 	for {
@@ -136,6 +141,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}, &Conn{
 			ConnId:  connId,
 			conn:    conn,
+			cancel:  cancel,
 			request: request,
 		})
 	}

@@ -9,13 +9,12 @@ import (
 
 	"github.com/acexy/golang-toolkit/sys"
 	"github.com/acexy/golang-toolkit/util/str"
-	"github.com/coder/websocket"
 	"github.com/golang-acexy/starter-parent/parent"
 	"github.com/golang-acexy/starter-websocket/wsstarter"
 )
 
 func TestServer(t *testing.T) {
-	err := parent.NewStarterLoader([]parent.Starter{
+	loader := parent.NewStarterLoader([]parent.Starter{
 		&wsstarter.WebsocketStarter{
 			Config: wsstarter.WebsocketConfig{
 				ListenAddress: ":8081",
@@ -28,7 +27,7 @@ func TestServer(t *testing.T) {
 								conn.Close()
 							}
 							if message.ToString() == "stream" {
-								streamMessage, _ := conn.SendStreamMessage(context.Background(), websocket.MessageText)
+								streamMessage, _ := conn.SendStreamTextMessage(context.Background())
 								streamMessage.Write([]byte("hello world"))
 								time.Sleep(time.Second)
 								streamMessage.Write([]byte("bye"))
@@ -45,9 +44,12 @@ func TestServer(t *testing.T) {
 				},
 			},
 		},
-	}).Start()
+	})
+	err := loader.Start()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sys.ShutdownSignal()
+	sys.ShutdownCallback(func() {
+		loader.StopBySetting()
+	})
 }
