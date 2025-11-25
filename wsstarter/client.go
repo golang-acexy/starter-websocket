@@ -16,18 +16,6 @@ import (
 	"github.com/coder/websocket"
 )
 
-type WSData struct {
-	Type websocket.MessageType
-	Data []byte
-}
-
-func (w *WSData) ToString() string {
-	if w.Type == websocket.MessageText {
-		return string(w.Data)
-	}
-	return fmt.Sprintf("%x", w.Data)
-}
-
 // ConnectionState 连接状态枚举
 type ConnectionState int32
 
@@ -66,11 +54,11 @@ type WSClient struct {
 
 	// 数据通道
 	blockReceive bool
-	receiveChan  chan *WSData
+	receiveChan  chan *Message
 
 	// 发送队列
 	blockSender bool
-	sendChan    chan *WSData
+	sendChan    chan *Message
 	sendMux     sync.Mutex
 
 	// 回调函数
@@ -137,8 +125,8 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		disableReconnect:     config.DisableReconnect,
 		reconnectInterval:    config.ReconnectInterval,
 		forceReconnect:       config.ForceReconnect,
-		receiveChan:          make(chan *WSData, config.ReceiveChanBufferLen),
-		sendChan:             make(chan *WSData, config.SendChanBufferLen),
+		receiveChan:          make(chan *Message, config.ReceiveChanBufferLen),
+		sendChan:             make(chan *Message, config.SendChanBufferLen),
 		onConnected:          config.OnConnected,
 		onDisconnected:       config.OnDisconnected,
 		onError:              config.OnError,
@@ -178,7 +166,7 @@ func (c *WSClient) IsConnected() bool {
 }
 
 // Connect 连接到 WebSocket 服务器
-func (c *WSClient) Connect() (<-chan *WSData, error) {
+func (c *WSClient) Connect() (<-chan *Message, error) {
 	if c.GetState() != StateWaitToConnect {
 		return nil, errors.New("client is not in wait to connect state")
 	}
@@ -247,20 +235,20 @@ func (c *WSClient) startMessageHandler() {
 	c.workerWg.Add(1)
 	go func() {
 		defer func() {
-			logger.Logrus().Traceln("websocket message handler exit")
+			logger.Logrus().Traceln("websocket message handlerWrapper exit")
 			c.workerWg.Done()
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Logrus().Errorf("websocket message handler panic: %v", r)
+				logger.Logrus().Errorf("websocket message handlerWrapper panic: %v", r)
 				// 发生panic时也要触发重连
-				c.handleConnectionError(fmt.Errorf("message handler panic: %v", r))
+				c.handleConnectionError(fmt.Errorf("message handlerWrapper panic: %v", r))
 			}
 		}()
 		for {
 			select {
 			case <-c.ctx.Done():
-				logger.Logrus().Warningln("websocket client message handler exit due to context cancellation")
+				logger.Logrus().Warningln("websocket client message handlerWrapper exit due to context cancellation")
 				return
 			default:
 				state := c.GetState()
@@ -295,13 +283,13 @@ func (c *WSClient) startMessageHandler() {
 				// 处理普通消息
 				if c.blockReceive {
 					select {
-					case c.receiveChan <- &WSData{Type: messageType, Data: data}:
+					case c.receiveChan <- &Message{Type: messageType, Data: data}:
 					case <-c.ctx.Done():
 						return
 					}
 				} else {
 					select {
-					case c.receiveChan <- &WSData{Type: messageType, Data: data}:
+					case c.receiveChan <- &Message{Type: messageType, Data: data}:
 					case <-c.ctx.Done():
 						return
 					default:
@@ -375,14 +363,14 @@ func (c *WSClient) Send(messageType websocket.MessageType, data []byte) error {
 	}
 	if c.blockSender {
 		select {
-		case c.sendChan <- &WSData{Type: messageType, Data: data}:
+		case c.sendChan <- &Message{Type: messageType, Data: data}:
 			return nil
 		case <-c.ctx.Done():
 			return errors.New("client is closing")
 		}
 	} else {
 		select {
-		case c.sendChan <- &WSData{Type: messageType, Data: data}:
+		case c.sendChan <- &Message{Type: messageType, Data: data}:
 			return nil
 		case <-c.ctx.Done():
 			return errors.New("client is closing")

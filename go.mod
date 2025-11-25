@@ -9,7 +9,9 @@ require (
 
 require (
 	github.com/golang-acexy/starter-parent v0.1.20 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/iancoleman/strcase v0.3.0 // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/sys v0.38.0 // indirect
