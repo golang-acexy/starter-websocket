@@ -139,7 +139,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			return
 		}
 		if c, ok := h.allConn[connId]; ok {
-			logger.Logrus().Warningln("uniqueConnId is true but connId:", connId, "already exists replace old conn")
+			logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists replace old conn")
 			c.Close()
 		}
 	}
