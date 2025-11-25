@@ -2,11 +2,15 @@ github.com/acexy/golang-toolkit v0.0.54 h1:eFVcWYXCJJWtfRkDD7vp/CKN9f67PhcIRgCJK
 github.com/acexy/golang-toolkit v0.0.54/go.mod h1:RhxILrytx3SUwgzzcnahBInn9YY8TmW9kfGb0o7bh7c=
 github.com/acexy/golang-toolkit v0.0.55 h1:CZKhaBh1fqoqMKJjYqac+zv714tTmpyyiexaZTr0zKY=
 github.com/acexy/golang-toolkit v0.0.55/go.mod h1:RhxILrytx3SUwgzzcnahBInn9YY8TmW9kfGb0o7bh7c=
+github.com/acexy/golang-toolkit v0.0.58 h1:nOBrAkfWf9PCD1ERosQNUiu0NkYglFCeiHErJkGw55E=
+github.com/acexy/golang-toolkit v0.0.58/go.mod h1:pbUFNbcuZiJpjS28xbdpkzEEruAekyegGZIUKLTvY+o=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/golang-acexy/starter-parent v0.1.20 h1:ldrICW/QmDaA3yuwMdD6GuKx9aLgSaBgkiG13Y4kojY=
+github.com/golang-acexy/starter-parent v0.1.20/go.mod h1:DCGDH3ekHzQXKvfGgk6ipJeZJjmzjfrewBHFcW1HUK4=
 github.com/iancoleman/strcase v0.3.0 h1:nTXanmYxhfFAMjZL34Ov6gkzEsSJZ5DbhxWjvSASxEI=
 github.com/iancoleman/strcase v0.3.0/go.mod h1:iwCmte+B7n89clKwxIoIXy/HfoL7AsD47ZCWhYzw7ho=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
