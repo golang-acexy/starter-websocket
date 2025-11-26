@@ -6,8 +6,11 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
+	"github.com/acexy/golang-toolkit/crypto/hashing"
 	"github.com/acexy/golang-toolkit/logger"
+	"github.com/acexy/golang-toolkit/math/random"
 	"github.com/coder/websocket"
 )
 
@@ -43,8 +46,8 @@ func NewBinaryMessage(data []byte) *Message {
 // Router WS路由
 type Router struct {
 	Path           string         // 路由路径
-	UniqueConnId   bool           // 该路由下 连接标识是否唯一
-	ConnIdentifier ConnIdentifier // 连接标识 (可用于做鉴权，GlobalIdentifier会覆盖为nil的设置)
+	UniqueConnId   bool           // 该路由下 连接标识是否强制唯一，若设置为强制唯一，重复链接的标识旧的将被自动关闭
+	ConnIdentifier ConnIdentifier // 连接标识 (可用于鉴权并为链接标识唯一id)
 	Handler        Handler        // 路由处理函数
 }
 
@@ -59,14 +62,20 @@ type handlerWrapper struct {
 	uniqueConnId   bool
 	connIdentifier ConnIdentifier
 	handler        Handler
-	allConn        map[string]*Conn
+	allConn        map[string]map[string]*Conn
 }
 
 type Conn struct {
-	ConnId  string
-	cancel  context.CancelFunc
-	conn    *websocket.Conn
-	request *http.Request
+	ConnId string // 连接标识Id 应用层分配
+
+	internalConnId string // 内部连接标识唯一
+	handlerWrapper *handlerWrapper
+	cancel         context.CancelFunc
+	conn           *websocket.Conn
+	request        *http.Request
+
+	createdAt       time.Time // 创建时间
+	lastReceivePing time.Time // 最后一次收到ping
 }
 
 // SendMessage 发送数据(适用于简短消息)
@@ -100,8 +109,7 @@ func (c *Conn) GetBinaryMessageWriterCtx(ctx context.Context) (io.WriteCloser, e
 }
 
 func (c *Conn) Close() {
-	_ = c.conn.CloseNow()
-	c.cancel()
+	c.handlerWrapper.closeConnByInternalId(c.ConnId, c.internalConnId)
 }
 
 // Request 请求包裹
@@ -119,8 +127,63 @@ func (r *Request) GetHeader(key string) string {
 	return r.Header.Get(key)
 }
 
+func (h *handlerWrapper) getConn(connId, internalConnId string) (*Conn, bool) {
+	defer h.mux.Unlock()
+	h.mux.Lock()
+	cs, flag := h.allConn[connId]
+	if flag {
+		c, flag := cs[internalConnId]
+		return c, flag
+	}
+	return nil, false
+}
+
+func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) {
+	defer h.mux.Unlock()
+	h.mux.Lock()
+	v, flag := h.allConn[connId]
+	if flag {
+		v[internalConnId] = conn
+	} else {
+		h.allConn[connId] = map[string]*Conn{internalConnId: conn}
+	}
+}
+
+func (h *handlerWrapper) closeConnById(connId string) {
+	defer h.mux.Unlock()
+	h.mux.Lock()
+	c, flag := h.allConn[connId]
+	if flag {
+		for i, v := range c {
+			_ = v.conn.CloseNow()
+			v.cancel()
+			delete(c, i)
+		}
+		delete(h.allConn, connId)
+		logger.Logrus().Infoln("connection closed:", connId)
+	}
+}
+func (h *handlerWrapper) closeConnByInternalId(connId, internalConnId string) {
+	defer h.mux.Unlock()
+	h.mux.Lock()
+	cs, flag := h.allConn[connId]
+	if flag {
+		c, flag := cs[internalConnId]
+		if flag {
+			_ = c.conn.CloseNow()
+			c.cancel()
+		}
+		delete(cs, internalConnId)
+		if len(cs) == 0 {
+			delete(h.allConn, connId)
+		}
+		logger.Logrus().Infoln("connection closed:", connId)
+	}
+}
+
 func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	var connId string
+	internalConnId := hashing.Sha256Hex(random.UUID() + time.Now().String() + random.RandString(20))
 	if h.connIdentifier != nil {
 		var err error
 		connId, err = h.connIdentifier(&Request{request})
@@ -130,7 +193,6 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			return
 		}
 	}
-	h.mux.Lock()
 	if h.uniqueConnId {
 		if connId == "" {
 			logger.Logrus().Errorln("uniqueConnId is true but connIdentifier return empty connId")
@@ -138,39 +200,87 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			h.mux.Unlock()
 			return
 		}
-		if c, ok := h.allConn[connId]; ok {
-			logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists replace old conn")
-			c.Close()
+		if _, ok := h.getConn(connId, internalConnId); ok {
+			logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists, replace the old conn")
+			h.closeConnById(connId)
 		}
 	}
 	ctx, cancel := context.WithCancel(request.Context())
-	conn, err := websocket.Accept(writer, request, webSocketConfig.AcceptOptions)
-	wsConn := &Conn{
-		ConnId:  connId,
-		conn:    conn,
-		cancel:  cancel,
-		request: request,
+	opt := webSocketConfig.AcceptOptions
+	if opt == nil {
+		opt = &websocket.AcceptOptions{}
 	}
-	h.allConn[connId] = wsConn
-	h.mux.Unlock()
+
+	// 启用默认keepalive规则
+	if webSocketConfig.DefaultKeepAliveConfig != nil && webSocketConfig.CustomKeepAliveConfig == nil {
+		// 启用了默认的keepalive规则
+		opt.OnPingReceived = func(ctx context.Context, payload []byte) bool {
+			c, flag := h.getConn(connId, internalConnId)
+			if flag {
+				c.lastReceivePing = time.Now()
+				return true
+			}
+			return false
+		}
+		go func() {
+			ticker := time.NewTicker(time.Millisecond * 500)
+			defer ticker.Stop()
+			keepAliveConfig := webSocketConfig.DefaultKeepAliveConfig
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					c, flag := h.getConn(connId, internalConnId)
+					if flag {
+						var lastReceivePing time.Time
+						if c.lastReceivePing.IsZero() {
+							lastReceivePing = c.createdAt
+						} else {
+							lastReceivePing = c.lastReceivePing
+						}
+						if time.Now().Sub(lastReceivePing) > keepAliveConfig.PingTimeout {
+							logger.Logrus().Infoln("connection ping timeout:", connId, keepAliveConfig.PingTimeout)
+							h.closeConnByInternalId(connId, internalConnId)
+							return
+						}
+						if keepAliveConfig.MaxConnectTime > 0 {
+							if time.Now().Sub(c.createdAt) > keepAliveConfig.MaxConnectTime { // 检查最大时间
+								logger.Logrus().Infoln("connection connect too long:", connId, keepAliveConfig.MaxConnectTime)
+								h.closeConnByInternalId(connId, internalConnId)
+								return
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	conn, err := websocket.Accept(writer, request, opt)
 	if err != nil {
 		logger.Logrus().WithError(err).Errorln("connId:", connId, "accept failed with error:", err)
+		cancel()
 		return
 	}
-	defer func(c *websocket.Conn) {
-		cancel()
-		_ = c.CloseNow()
-		logger.Logrus().Infoln("connection closed:", connId)
-		delete(h.allConn, connId)
-	}(conn)
+	wsConn := &Conn{
+		ConnId:         connId,
+		internalConnId: internalConnId,
+		handlerWrapper: h,
+		conn:           conn,
+		cancel:         cancel,
+		request:        request,
+		createdAt:      time.Now(),
+	}
+	h.saveConn(connId, internalConnId, wsConn)
+	defer func() {
+		h.closeConnById(connId)
+	}()
 	for {
 		typ, data, readErr := conn.Read(ctx)
 		if readErr != nil {
 			return
 		}
-		h.handler(Message{
-			Type: typ,
-			Data: data,
-		}, wsConn)
+		h.handler(Message{Type: typ, Data: data}, wsConn)
 	}
 }

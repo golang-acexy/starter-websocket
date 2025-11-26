@@ -526,6 +526,11 @@ func (c *WSClient) Close() error {
 	return c.CloseWithError(nil)
 }
 
+// Ping 发送心跳包
+func (c *WSClient) Ping() error {
+	return c.conn.Ping(context.Background())
+}
+
 // CloseWithError 带错误信息的关闭连接
 func (c *WSClient) CloseWithError(closeErr error) error {
 	var err error

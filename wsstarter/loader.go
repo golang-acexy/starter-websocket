@@ -16,15 +16,34 @@ var webSocketConfig *WebsocketConfig
 var server *http.Server
 
 type WebsocketConfig struct {
-	ListenAddress        string                   // ip:port
-	AcceptOptions        *websocket.AcceptOptions // websocket.AcceptOptions
-	GlobalConnIdentifier ConnIdentifier           // 全局连接标识符/鉴权操作 将覆盖未设置该行为的router
-	Routers              []*Router                // WS路由
+	ListenAddress string // ip:port
+	// websocket.AcceptOptions 原始参数设置 注意当设置DefaultKeepAliveConfig/CustomKeepAliveConfig后 OnPingReceived & OnPongReceived 设置将被忽略
+	AcceptOptions  *websocket.AcceptOptions
+	ConnIdentifier ConnIdentifier
+
+	GlobalConnIdentifier ConnIdentifier // 全局连接标识符/鉴权操作 将覆盖未设置该行为的router
+	Routers              []*Router      // WS路由设置
+
+	DefaultKeepAliveConfig *DefaultKeepAliveConfig // 默认的KeepAlive配置 如果不设置则不起用该规则
+	CustomKeepAliveConfig  *CustomKeepAliveConfig  // TODO: 自定义的KeepAlive配置 该配置高于默认规则 只生效一个
 }
 
+// DefaultKeepAliveConfig 默认的KeepAlive配置
+// 默认连接保持采用被动模式
+// 客户端需要在指定时间内发送ws的ping帧，服务端自动回复ws的pong帧
+// 如果超过指定时间没有收到ping帧，则主动断开连接
+type DefaultKeepAliveConfig struct {
+	PingTimeout    time.Duration // ping帧的超时时间
+	MaxConnectTime time.Duration // 连接保持最大时长 不设置时则不启用该规则
+}
+
+// CustomKeepAliveConfig 自定义的KeepAlive配置
+type CustomKeepAliveConfig struct{}
+
 type WebsocketStarter struct {
-	Config           WebsocketConfig
-	LazyConfig       func() WebsocketConfig
+	Config     WebsocketConfig
+	LazyConfig func() WebsocketConfig
+
 	config           *WebsocketConfig
 	WebsocketSetting *parent.Setting
 }
@@ -62,15 +81,21 @@ func (w *WebsocketStarter) Start() (any, error) {
 	if len(config.Routers) == 0 {
 		return nil, errors.New("miss routers")
 	}
+
+	// 检查配置
+	if config.DefaultKeepAliveConfig != nil && config.CustomKeepAliveConfig == nil && config.DefaultKeepAliveConfig.PingTimeout == 0 {
+		return nil, errors.New("default keep alive config ping timeout must be greater than 0")
+	}
+
 	listenAddr := config.ListenAddress
-	muxSrv := http.NewServeMux()
+	serveMux := http.NewServeMux()
 	var err error
 	coll.SliceForeach(config.Routers, func(router *Router) bool {
 		if router.Handler == nil {
 			err = errors.New("path miss handler: " + router.Path)
 			return false
 		}
-		muxSrv.Handle(router.Path, &handlerWrapper{
+		serveMux.Handle(router.Path, &handlerWrapper{
 			connIdentifier: func() ConnIdentifier {
 				if config.GlobalConnIdentifier != nil && router.ConnIdentifier == nil {
 					return config.GlobalConnIdentifier
@@ -79,19 +104,21 @@ func (w *WebsocketStarter) Start() (any, error) {
 			}(),
 			handler:      router.Handler,
 			uniqueConnId: router.UniqueConnId,
-			allConn:      map[string]*Conn{},
+			allConn:      make(map[string]map[string]*Conn),
 		})
 		return true
 	})
+
 	if err != nil {
 		return nil, err
 	}
 	if listenAddr == "" {
 		listenAddr = ":8081"
 	}
+
 	server = &http.Server{
 		Addr:    listenAddr,
-		Handler: muxSrv,
+		Handler: serveMux,
 	}
 
 	errChn := make(chan error)
@@ -100,7 +127,6 @@ func (w *WebsocketStarter) Start() (any, error) {
 			errChn <- err
 		}
 	}()
-
 	select {
 	case <-time.After(time.Second):
 		return server, nil

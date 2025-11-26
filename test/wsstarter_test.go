@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/acexy/golang-toolkit/logger"
 	"github.com/acexy/golang-toolkit/sys"
@@ -35,12 +36,24 @@ func TestServer(t *testing.T) {
 							}
 						},
 					},
+					{
+						Path: "/ws1",
+						ConnIdentifier: func(request *wsstarter.Request) (string, error) {
+							return "123456", nil
+						},
+						Handler: func(message wsstarter.Message, conn *wsstarter.Conn) {
+							fmt.Println(conn.ConnId, message.ToString())
+						},
+					},
 				},
 				GlobalConnIdentifier: func(request *wsstarter.Request) (string, error) {
 					if !str.HasText(request.GetQuery("id")) {
 						return "", errors.New("miss id")
 					}
 					return request.GetQuery("id"), nil
+				},
+				DefaultKeepAliveConfig: &wsstarter.DefaultKeepAliveConfig{
+					PingTimeout: 5 * time.Second,
 				},
 			},
 		},
