@@ -17,8 +17,11 @@ func TestClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := make(chan struct{})
 	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL:          "wss://fstream.binance.com/ws/btcusdt@markPrice@1s",
-		HttpProxyURL: "http://localhost:7890",
+		URL: "wss://fstream.binance.com/ws/btcusdt@markPrice@1s",
+		//HttpProxyURL: "http://localhost:7890",
+		HttpProxyURLFn: func() string {
+			return "http://localhost:7890"
+		},
 		OnConnected: func() {
 			logger.Logrus().Infoln("ws connected")
 		},
@@ -41,7 +44,7 @@ func TestClient(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for v := range dataChn {
-			fmt.Println(v)
+			fmt.Println(v.ToString())
 		}
 	}()
 	wg.Add(1)

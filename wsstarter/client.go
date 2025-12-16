@@ -35,10 +35,12 @@ type WSClient struct {
 
 	httpProxyFn func() string
 	httpProxy   string
-	conn        *websocket.Conn
-	cancel      context.CancelFunc
-	ctx         context.Context
-	opts        *websocket.DialOptions
+
+	conn     *websocket.Conn
+	response *http.Response
+	cancel   context.CancelFunc
+	ctx      context.Context
+	opts     *websocket.DialOptions
 
 	// 连接状态管理
 	state    atomic.Value // ConnectionState
@@ -195,7 +197,7 @@ func (c *WSClient) dial() error {
 		var err error
 		if c.httpProxyFn != nil {
 			proxyUrl := c.httpProxyFn()
-			if !str.HasText(proxyUrl) {
+			if str.HasText(proxyUrl) {
 				proxyURL, err = url.Parse(proxyUrl)
 				if err != nil {
 					return fmt.Errorf("invalid proxy address: %s %w", proxyUrl, err)
@@ -217,7 +219,7 @@ func (c *WSClient) dial() error {
 			c.opts.HTTPClient = &http.Client{Transport: transport}
 		}
 	}
-	conn, _, err := websocket.Dial(c.ctx, c.url, c.opts)
+	conn, response, err := websocket.Dial(c.ctx, c.url, c.opts)
 	if err != nil {
 		return err
 	}
@@ -225,6 +227,7 @@ func (c *WSClient) dial() error {
 		conn.SetReadLimit(c.readMaxBytesLimit)
 	}
 	c.stateMux.Lock()
+	c.response = response
 	c.conn = conn
 	c.stateMux.Unlock()
 	return nil
