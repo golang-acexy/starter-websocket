@@ -2,7 +2,6 @@ package wsstarter
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -170,7 +169,7 @@ func (c *WSClient) IsConnected() bool {
 // Connect 连接到 WebSocket 服务器
 func (c *WSClient) Connect() (<-chan *Message, error) {
 	if c.GetState() != StateWaitToConnect {
-		return nil, errors.New("client is not in wait to connect state")
+		return nil, ErrClientNotWaitToConnect
 	}
 	c.setState(StateConnecting)
 	// 建立连接
@@ -267,7 +266,7 @@ func (c *WSClient) startMessageHandler() {
 				c.stateMux.RUnlock()
 				if conn == nil {
 					logger.Logrus().Warningln("connection is nil, triggering reconnect")
-					c.handleConnectionError(errors.New("connection is nil"))
+					c.handleConnectionError(ErrConnectionNil)
 					return
 				}
 
@@ -361,24 +360,26 @@ func (c *WSClient) startMessageSender() {
 
 // Send 发送消息
 func (c *WSClient) Send(messageType websocket.MessageType, data []byte) error {
+	c.sendMux.Lock()
+	defer c.sendMux.Unlock()
 	if !c.IsConnected() {
-		return errors.New("client is not connected")
+		return ErrClientNotConnected
 	}
 	if c.blockSender {
 		select {
 		case c.sendChan <- &Message{Type: messageType, Data: data}:
 			return nil
 		case <-c.ctx.Done():
-			return errors.New("client is closing")
+			return ErrClientClosing
 		}
 	} else {
 		select {
 		case c.sendChan <- &Message{Type: messageType, Data: data}:
 			return nil
 		case <-c.ctx.Done():
-			return errors.New("client is closing")
+			return ErrClientClosing
 		default:
-			return errors.New("send channel is full")
+			return ErrSendChannelFull
 		}
 	}
 }
@@ -518,7 +519,7 @@ func (c *WSClient) reconnect() {
 		logger.Logrus().Warningln("websocket reconnect failed after all attempts")
 		c.setState(StateDisconnected)
 		if c.onError != nil {
-			c.onError(errors.New("reconnection failed after all attempts"))
+			c.onError(ErrReconnectAttemptsExhausted)
 		}
 		_ = c.Close()
 	}()
@@ -552,8 +553,10 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		c.cancel()
 
 		// 关闭通道
+		c.sendMux.Lock()
 		close(c.receiveChan)
 		close(c.sendChan)
+		c.sendMux.Unlock()
 
 		// 等待所有工作协程完成
 		done := make(chan struct{})

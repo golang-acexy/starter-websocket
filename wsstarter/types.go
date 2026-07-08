@@ -138,6 +138,13 @@ func (h *handlerWrapper) getConn(connId, internalConnId string) (*Conn, bool) {
 	return nil, false
 }
 
+func (h *handlerWrapper) hasConn(connId string) bool {
+	defer h.mux.Unlock()
+	h.mux.Lock()
+	cs, flag := h.allConn[connId]
+	return flag && len(cs) > 0
+}
+
 func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) {
 	defer h.mux.Unlock()
 	h.mux.Lock()
@@ -197,22 +204,27 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if connId == "" {
 			logger.Logrus().Errorln("uniqueConnId is true but connIdentifier return empty connId")
 			writer.WriteHeader(http.StatusInternalServerError)
-			h.mux.Unlock()
 			return
 		}
-		if _, ok := h.getConn(connId, internalConnId); ok {
+		if h.hasConn(connId) {
 			logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists, replace the old conn")
 			h.closeConnById(connId)
 		}
 	}
 	ctx, cancel := context.WithCancel(request.Context())
-	opt := webSocketConfig.AcceptOptions
+	config := currentWebsocketConfig()
+	if config == nil {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		cancel()
+		return
+	}
+	opt := config.AcceptOptions
 	if opt == nil {
 		opt = &websocket.AcceptOptions{}
 	}
 
 	// 启用默认keepalive规则
-	if webSocketConfig.DefaultKeepAliveConfig != nil && webSocketConfig.CustomKeepAliveConfig == nil {
+	if config.DefaultKeepAliveConfig != nil {
 		// 启用了默认的keepalive规则
 		opt.OnPingReceived = func(ctx context.Context, payload []byte) bool {
 			c, flag := h.getConn(connId, internalConnId)
@@ -225,7 +237,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		go func() {
 			ticker := time.NewTicker(time.Millisecond * 500)
 			defer ticker.Stop()
-			keepAliveConfig := webSocketConfig.DefaultKeepAliveConfig
+			keepAliveConfig := config.DefaultKeepAliveConfig
 			for {
 				select {
 				case <-ctx.Done():
@@ -274,7 +286,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	}
 	h.saveConn(connId, internalConnId, wsConn)
 	defer func() {
-		h.closeConnById(connId)
+		h.closeConnByInternalId(connId, internalConnId)
 	}()
 	for {
 		typ, data, readErr := conn.Read(ctx)

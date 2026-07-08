@@ -17,7 +17,7 @@ func TestClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := make(chan struct{})
 	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL: "wss://fstream.binance.com/ws/btcusdt@markPrice@1s",
+		URL: "wss://fstream.binance.com/market/ws/btcusdt@markPrice@1s",
 		//HttpProxyURL: "http://localhost:7890",
 		HttpProxyURLFn: func() string {
 			return "http://localhost:7890"

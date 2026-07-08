@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/acexy/golang-toolkit/logger"
 	"github.com/acexy/golang-toolkit/sys"
@@ -15,7 +14,7 @@ import (
 
 func TestServer(t *testing.T) {
 	logger.EnableConsole(logger.TraceLevel)
-	loader := parent.NewStarterLoader([]parent.Starter{
+	loader := parent.InitStarterLoader([]parent.Starter{
 		&wsstarter.WebsocketStarter{
 			Config: wsstarter.WebsocketConfig{
 				ListenAddress: ":8081",
@@ -52,9 +51,9 @@ func TestServer(t *testing.T) {
 					}
 					return request.GetQuery("id"), nil
 				},
-				DefaultKeepAliveConfig: &wsstarter.DefaultKeepAliveConfig{
-					PingTimeout: 5 * time.Second,
-				},
+				//DefaultKeepAliveConfig: &wsstarter.DefaultKeepAliveConfig{
+				//	PingTimeout: 5 * time.Second,
+				//},
 			},
 		},
 	})
@@ -63,6 +62,6 @@ func TestServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	sys.ShutdownCallback(func() {
-		loader.StopBySetting()
+		loader.StopAllBySetting()
 	})
 }
