@@ -5,7 +5,7 @@ go 1.25.8
 require (
 	github.com/acexy/golang-toolkit v0.0.65-0.20260708022919-0acbe3b6386d
 	github.com/coder/websocket v1.8.15
-	github.com/golang-acexy/starter-parent v0.1.23-0.20260708032210-6a1c7daa5a03
+	github.com/golang-acexy/starter-parent v0.1.23-0.20260713093351-c249c35849a4
 )
 
 require (

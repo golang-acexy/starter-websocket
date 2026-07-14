@@ -4,8 +4,8 @@ github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNU
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/golang-acexy/starter-parent v0.1.23-0.20260708032210-6a1c7daa5a03 h1:sAWR9CrbYMTFXokCYksN3U8RX2AI2S06IguRj/fYYVE=
-github.com/golang-acexy/starter-parent v0.1.23-0.20260708032210-6a1c7daa5a03/go.mod h1:4KEH7Dvpyzakucw7/S5sW6rJ+/VbDTfGGmh4BeHnpbQ=
+github.com/golang-acexy/starter-parent v0.1.23-0.20260713093351-c249c35849a4 h1:ghOij6U67J96uBbew3eV+z5UZAsIym2ho/0SM4iAJ/g=
+github.com/golang-acexy/starter-parent v0.1.23-0.20260713093351-c249c35849a4/go.mod h1:4KEH7Dvpyzakucw7/S5sW6rJ+/VbDTfGGmh4BeHnpbQ=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/iancoleman/strcase v0.3.0 h1:nTXanmYxhfFAMjZL34Ov6gkzEsSJZ5DbhxWjvSASxEI=
