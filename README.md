@@ -3,6 +3,10 @@
 `starter-websocket` provides a parent-managed WebSocket starter and a reusable client based on `github.com/coder/websocket`.
 It is designed for the golang-acexy starter ecosystem, where each starter owns one focused capability and is started by `starter-parent`.
 
+## Ecosystem Role
+
+This module covers long-lived bidirectional connections that do not fit the request/response model of `starter-gin` or `starter-grpc`. It includes both a parent-managed server and an independently reusable client.
+
 ## Requirements
 
 - Go `1.25.8`
@@ -103,3 +107,5 @@ Common starter and client errors are defined in `wsstarter/error.go`, including 
 ## Development
 
 Use the parent loader for server startup and shutdown in integration code. Keep each router focused on one WebSocket endpoint, and place connection authentication or ID extraction in `ConnIdentifier` rather than inside message handlers.
+
+`WebsocketStarter` is the only standard starter that enables parent-managed restart. After `StopStarter` completes successfully, calling `StartStarter("Websocket-Starter")` starts it again with the current static or lazy configuration. Other standard starters reject this lifecycle transition with `parent.ErrStarterRestartDisabled`.

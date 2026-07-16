@@ -69,6 +69,7 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 	}
 	return parent.NewSetting(
 		"Websocket-Starter",
+		true,
 		1,
 		false,
 		time.Second*30,
