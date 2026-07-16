@@ -2,8 +2,9 @@ package wsstarter
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/acexy/golang-toolkit/util/coll"
@@ -14,10 +15,11 @@ import (
 
 var webSocketConfig *WebsocketConfig
 var server *http.Server
+var serverLock sync.RWMutex
 
 type WebsocketConfig struct {
 	ListenAddress string // ip:port
-	// websocket.AcceptOptions 原始参数设置 注意当设置DefaultKeepAliveConfig/CustomKeepAliveConfig后 OnPingReceived & OnPongReceived 设置将被忽略
+	// websocket.AcceptOptions 原始参数设置 注意当设置DefaultKeepAliveConfig后 OnPingReceived & OnPongReceived 设置将被忽略
 	AcceptOptions  *websocket.AcceptOptions
 	ConnIdentifier ConnIdentifier
 
@@ -25,7 +27,6 @@ type WebsocketConfig struct {
 	Routers              []*Router      // WS路由设置
 
 	DefaultKeepAliveConfig *DefaultKeepAliveConfig // 默认的KeepAlive配置 如果不设置则不起用该规则
-	CustomKeepAliveConfig  *CustomKeepAliveConfig  // TODO: 自定义的KeepAlive配置 该配置高于默认规则 只生效一个
 }
 
 // DefaultKeepAliveConfig 默认的KeepAlive配置
@@ -36,9 +37,6 @@ type DefaultKeepAliveConfig struct {
 	PingTimeout    time.Duration // ping帧的超时时间
 	MaxConnectTime time.Duration // 连接保持最大时长 不设置时则不启用该规则
 }
-
-// CustomKeepAliveConfig 自定义的KeepAlive配置
-type CustomKeepAliveConfig struct{}
 
 type WebsocketStarter struct {
 	Config     WebsocketConfig
@@ -59,7 +57,9 @@ func (w *WebsocketStarter) getConfig() *WebsocketConfig {
 		config = w.Config
 	}
 	w.config = &config
+	serverLock.Lock()
 	webSocketConfig = &config
+	serverLock.Unlock()
 	return w.config
 }
 
@@ -69,6 +69,7 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 	}
 	return parent.NewSetting(
 		"Websocket-Starter",
+		true,
 		1,
 		false,
 		time.Second*30,
@@ -79,20 +80,27 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 func (w *WebsocketStarter) Start() (any, error) {
 	config := w.getConfig()
 	if len(config.Routers) == 0 {
-		return nil, errors.New("miss routers")
+		return nil, ErrMissRouters
 	}
 
 	// 检查配置
-	if config.DefaultKeepAliveConfig != nil && config.CustomKeepAliveConfig == nil && config.DefaultKeepAliveConfig.PingTimeout == 0 {
-		return nil, errors.New("default keep alive config ping timeout must be greater than 0")
+	if config.DefaultKeepAliveConfig != nil && config.DefaultKeepAliveConfig.PingTimeout == 0 {
+		return nil, ErrKeepAlivePingTimeoutRequired
 	}
+	serverLock.Lock()
+	if server != nil {
+		current := server
+		serverLock.Unlock()
+		return current, ErrWebsocketServerAlreadyStarted
+	}
+	serverLock.Unlock()
 
 	listenAddr := config.ListenAddress
 	serveMux := http.NewServeMux()
 	var err error
-	coll.SliceForeach(config.Routers, func(router *Router) bool {
+	coll.SliceForEach(config.Routers, func(router *Router) bool {
 		if router.Handler == nil {
-			err = errors.New("path miss handler: " + router.Path)
+			err = fmt.Errorf("%w: %s", ErrRouterHandlerMissing, router.Path)
 			return false
 		}
 		serveMux.Handle(router.Path, &handlerWrapper{
@@ -116,33 +124,64 @@ func (w *WebsocketStarter) Start() (any, error) {
 		listenAddr = ":8081"
 	}
 
-	server = &http.Server{
+	wsServer := &http.Server{
 		Addr:    listenAddr,
 		Handler: serveMux,
 	}
+	serverLock.Lock()
+	server = wsServer
+	serverLock.Unlock()
 
-	errChn := make(chan error)
+	errChn := make(chan error, 1)
 	go func() {
-		if err = server.ListenAndServe(); err != nil {
-			errChn <- err
+		if listenErr := wsServer.ListenAndServe(); listenErr != nil && listenErr != http.ErrServerClosed {
+			errChn <- listenErr
 		}
 	}()
 	select {
 	case <-time.After(time.Second):
-		return server, nil
+		return wsServer, nil
 	case err = <-errChn:
-		return server, err
+		clearWebsocketServer(wsServer)
+		return wsServer, err
 	}
 }
 
 func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped bool, err error) {
+	wsServer := RawWebsocketServer()
+	if wsServer == nil {
+		return false, true, ErrWebsocketServerNotStarted
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), maxWaitTime)
 	defer cancel()
-	if err = server.Shutdown(ctx); err != nil {
+	if err = wsServer.Shutdown(ctx); err != nil {
 		gracefully = false
 	} else {
 		gracefully = true
 	}
 	stopped = !net.Telnet(w.getConfig().ListenAddress, time.Second)
+	clearWebsocketServer(wsServer)
 	return
+}
+
+// RawWebsocketServer 获取原始websocket http server实例。
+func RawWebsocketServer() *http.Server {
+	serverLock.RLock()
+	defer serverLock.RUnlock()
+	return server
+}
+
+func currentWebsocketConfig() *WebsocketConfig {
+	serverLock.RLock()
+	defer serverLock.RUnlock()
+	return webSocketConfig
+}
+
+func clearWebsocketServer(wsServer *http.Server) {
+	serverLock.Lock()
+	defer serverLock.Unlock()
+	if server == wsServer {
+		server = nil
+		webSocketConfig = nil
+	}
 }
