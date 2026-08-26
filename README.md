@@ -9,7 +9,7 @@ This module covers long-lived bidirectional connections that do not fit the requ
 
 ## Requirements
 
-- Go `1.25.8`
+- Go `1.26.7`
 - `github.com/golang-acexy/starter-parent`
 
 ## Installation
@@ -33,6 +33,8 @@ Supported capabilities:
 - Optional maximum connection lifetime through `DefaultKeepAliveConfig.MaxConnectTime`.
 - Raw `websocket.AcceptOptions` passthrough. When default keepalive is enabled, ping handling is owned by the starter.
 - Raw server access through `RawWebsocketServer()`.
+
+The starter validates nil routers, empty or duplicate paths, missing handlers, and invalid keepalive durations before binding the listener. Configuration and `AcceptOptions` are cloned before use so concurrent connections cannot overwrite each other's ping callbacks. Startup binds the listener synchronously, and shutdown closes all upgraded WebSocket connections before stopping the HTTP server.
 
 ```go
 starter := &wsstarter.WebsocketStarter{
@@ -98,14 +100,18 @@ Client configuration highlights:
 - `DisableReconnect`, `ForceReconnect`, `MaxReconnectAttempts`, and `ReconnectInterval` for reconnect behavior.
 - `BlockReceive` and `BlockSender` for blocking channel behavior.
 - `ReceiveChanBufferLen`, `SendChanBufferLen`, and `ReadMaxBytesLimit` for queue and read limits.
-- `SendText`, `SendBinary`, `Ping`, `Close`, and `GetState` for common operations.
+- `SendText`, `SendBinary`, `Ping`, `PingContext`, `Close`, and `GetState` for common operations.
+
+Client state transitions use atomic compare-and-swap operations, so concurrent connection failures can start at most one reconnect flow. Closing first prevents new workers, cancels the client context, closes the active connection, waits for workers, and then closes the receive channel. The send channel remains internal and is not closed while producers or workers may still reference it.
 
 ## Error Handling
 
-Common starter and client errors are defined in `wsstarter/error.go`, including duplicated server startup, missing routers, missing router handlers, invalid keepalive configuration, invalid client state, closed clients, full send queues, and reconnect exhaustion.
+Common starter and client errors are defined in `wsstarter/error.go`, including duplicated server startup, nil or duplicate routers, invalid keepalive configuration, missing client URLs, invalid reconnect settings, invalid client state, closed clients, full send queues, and reconnect exhaustion.
 
 ## Development
 
 Use the parent loader for server startup and shutdown in integration code. Keep each router focused on one WebSocket endpoint, and place connection authentication or ID extraction in `ConnIdentifier` rather than inside message handlers.
 
 `WebsocketStarter` is the only standard starter that enables parent-managed restart. After `StopStarter` completes successfully, calling `StartStarter("Websocket-Starter")` starts it again with the current static or lazy configuration. Other standard starters reject this lifecycle transition with `parent.ErrStarterRestartDisabled`.
+
+Tests use local random ports and in-process WebSocket servers. They do not require external services, local proxies, fixed ports, or indefinite shutdown holding.

@@ -18,11 +18,11 @@ import (
 // ConnectionState 连接状态枚举
 type ConnectionState int32
 
-var defaultDataChanLength = 500
+const defaultDataChanLength = 500
 
 const (
 	StateWaitToConnect ConnectionState = iota
-	StateDisconnected                  = iota
+	StateDisconnected
 	StateConnecting
 	StateConnected
 	StateReconnecting
@@ -42,8 +42,8 @@ type WSClient struct {
 	opts     *websocket.DialOptions
 
 	// 连接状态管理
-	state    atomic.Value // ConnectionState
-	stateMux sync.RWMutex
+	state   atomic.Int32
+	connMux sync.RWMutex
 
 	// 重连配置
 	maxReconnectAttempts int
@@ -69,10 +69,13 @@ type WSClient struct {
 	onClosed       func(error) // 客户端关闭时的一次性回调
 
 	// 优雅关闭
-	closeOnce sync.Once
+	closeOnce   sync.Once
+	closeResult error
 
 	// 用于跟踪各个协程的完成状态
-	workerWg sync.WaitGroup
+	workerWg      sync.WaitGroup
+	workerMux     sync.Mutex
+	workersClosed bool
 }
 
 // WSClientConfig 配置结构
@@ -102,6 +105,9 @@ type WSClientConfig struct {
 }
 
 func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	if config.MaxReconnectAttempts == 0 {
 		config.MaxReconnectAttempts = 3
@@ -121,7 +127,7 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		url:                  config.URL,
 		httpProxy:            config.HttpProxyURL,
 		httpProxyFn:          config.HttpProxyURLFn,
-		opts:                 config.DialOptions,
+		opts:                 cloneDialOptions(config.DialOptions),
 		maxReconnectAttempts: config.MaxReconnectAttempts,
 		disableReconnect:     config.DisableReconnect,
 		reconnectInterval:    config.ReconnectInterval,
@@ -138,27 +144,41 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	}
 	client.setState(StateWaitToConnect)
 	// 启动context监听协程，当context取消时执行优雅关闭
+	client.workerWg.Add(1)
 	go client.contextMonitor()
 	return client
 }
 
 // contextMonitor 监听context取消事件，执行优雅关闭
 func (c *WSClient) contextMonitor() {
-	c.workerWg.Add(1)
 	<-c.ctx.Done()
 	logger.Logrus().Traceln("context cancelled, initiating graceful shutdown")
 	c.workerWg.Done()
 	_ = c.Close()
 }
 
+func (c *WSClient) addWorker() bool {
+	c.workerMux.Lock()
+	defer c.workerMux.Unlock()
+	if c.workersClosed {
+		return false
+	}
+	c.workerWg.Add(1)
+	return true
+}
+
 // setState 设置连接状态
 func (c *WSClient) setState(state ConnectionState) {
-	c.state.Store(state)
+	c.state.Store(int32(state))
 }
 
 // GetState 获取连接状态
 func (c *WSClient) GetState() ConnectionState {
-	return c.state.Load().(ConnectionState)
+	return ConnectionState(c.state.Load())
+}
+
+func (c *WSClient) transitionState(from, to ConnectionState) bool {
+	return c.state.CompareAndSwap(int32(from), int32(to))
 }
 
 // IsConnected 检查是否已连接
@@ -168,20 +188,31 @@ func (c *WSClient) IsConnected() bool {
 
 // Connect 连接到 WebSocket 服务器
 func (c *WSClient) Connect() (<-chan *Message, error) {
-	if c.GetState() != StateWaitToConnect {
+	if c.url == "" {
+		return nil, ErrClientURLMissing
+	}
+	if c.maxReconnectAttempts < 0 {
+		return nil, ErrReconnectAttemptsInvalid
+	}
+	if c.reconnectInterval < 0 {
+		return nil, ErrReconnectIntervalInvalid
+	}
+	if !c.transitionState(StateWaitToConnect, StateConnecting) {
 		return nil, ErrClientNotWaitToConnect
 	}
-	c.setState(StateConnecting)
 	// 建立连接
 	if err := c.dial(); err != nil {
-		c.setState(StateDisconnected)
+		c.transitionState(StateConnecting, StateDisconnected)
 		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+	if !c.transitionState(StateConnecting, StateConnected) {
+		c.closeCurrentConnection()
+		return nil, ErrClientClosing
 	}
 	// 启动消息处理协程
 	c.startMessageHandler()
 	// 启动发送协程
 	c.startMessageSender()
-	c.setState(StateConnected)
 	if c.onConnected != nil {
 		c.onConnected()
 	}
@@ -191,6 +222,10 @@ func (c *WSClient) Connect() (<-chan *Message, error) {
 
 // dial 建立 WebSocket 连接
 func (c *WSClient) dial() error {
+	dialOptions := websocket.DialOptions{}
+	if c.opts != nil {
+		dialOptions = *c.opts
+	}
 	if c.httpProxyFn != nil || c.httpProxy != "" {
 		var proxyURL *url.URL
 		var err error
@@ -212,29 +247,28 @@ func (c *WSClient) dial() error {
 			transport := &http.Transport{
 				Proxy: http.ProxyURL(proxyURL),
 			}
-			if c.opts == nil {
-				c.opts = &websocket.DialOptions{}
-			}
-			c.opts.HTTPClient = &http.Client{Transport: transport}
+			dialOptions.HTTPClient = &http.Client{Transport: transport}
 		}
 	}
-	conn, response, err := websocket.Dial(c.ctx, c.url, c.opts)
+	conn, response, err := websocket.Dial(c.ctx, c.url, &dialOptions)
 	if err != nil {
 		return err
 	}
 	if c.readMaxBytesLimit > 0 {
 		conn.SetReadLimit(c.readMaxBytesLimit)
 	}
-	c.stateMux.Lock()
+	c.connMux.Lock()
 	c.response = response
 	c.conn = conn
-	c.stateMux.Unlock()
+	c.connMux.Unlock()
 	return nil
 }
 
 // startMessageHandler 启动消息处理协程
 func (c *WSClient) startMessageHandler() {
-	c.workerWg.Add(1)
+	if !c.addWorker() {
+		return
+	}
 	go func() {
 		defer func() {
 			logger.Logrus().Traceln("websocket message handlerWrapper exit")
@@ -261,9 +295,9 @@ func (c *WSClient) startMessageHandler() {
 					time.Sleep(time.Millisecond * 100)
 					continue
 				}
-				c.stateMux.RLock()
+				c.connMux.RLock()
 				conn := c.conn
-				c.stateMux.RUnlock()
+				c.connMux.RUnlock()
 				if conn == nil {
 					logger.Logrus().Warningln("connection is nil, triggering reconnect")
 					c.handleConnectionError(ErrConnectionNil)
@@ -305,7 +339,9 @@ func (c *WSClient) startMessageHandler() {
 
 // startMessageSender 启动发送协程
 func (c *WSClient) startMessageSender() {
-	c.workerWg.Add(1)
+	if !c.addWorker() {
+		return
+	}
 	go func() {
 		defer func() {
 			c.workerWg.Done()
@@ -324,9 +360,9 @@ func (c *WSClient) startMessageSender() {
 					logger.Logrus().Warningln("not connected, dropping message")
 					continue
 				}
-				c.stateMux.RLock()
+				c.connMux.RLock()
 				conn := c.conn
-				c.stateMux.RUnlock()
+				c.connMux.RUnlock()
 
 				if conn == nil {
 					logger.Logrus().Warningln("connection is nil in sender")
@@ -402,20 +438,27 @@ func (c *WSClient) handleConnectionError(err error) {
 		return
 	}
 
-	currentState := c.GetState()
-	if currentState == StateClosed || currentState == StateReconnecting {
+	for {
+		currentState := c.GetState()
+		if currentState == StateClosed || currentState == StateReconnecting || currentState == StateDisconnected {
+			return
+		}
+		nextState := StateDisconnected
+		if c.shouldReconnect(err) {
+			nextState = StateReconnecting
+		}
+		if !c.transitionState(currentState, nextState) {
+			continue
+		}
+		logger.Logrus().Warningf("websocket connection error: %v", err)
+		c.closeCurrentConnection()
+		if c.onDisconnected != nil {
+			c.onDisconnected(err)
+		}
+		if nextState == StateReconnecting {
+			c.reconnect()
+		}
 		return
-	}
-	logger.Logrus().Warningf("websocket connection error: %v", err)
-
-	// 调用断开连接回调
-	if c.onDisconnected != nil {
-		c.onDisconnected(err)
-	}
-
-	// 判断是否需要重连
-	if c.shouldReconnect(err) {
-		c.reconnect()
 	}
 }
 
@@ -438,14 +481,13 @@ func (c *WSClient) shouldReconnect(err error) bool {
 
 // reconnect 重连逻辑
 func (c *WSClient) reconnect() {
-	currentState := c.GetState()
-	if currentState == StateClosed || currentState == StateReconnecting {
+	if c.GetState() != StateReconnecting {
 		return
 	}
-
-	c.setState(StateReconnecting)
 	logger.Logrus().Debugln("starting websocket reconnection process")
-	c.workerWg.Add(1)
+	if !c.addWorker() {
+		return
+	}
 	go func() {
 		defer c.workerWg.Done()
 		backoffDelay := c.reconnectInterval
@@ -471,13 +513,6 @@ func (c *WSClient) reconnect() {
 			} else {
 				logger.Logrus().Debugf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
 			}
-			// 确保旧连接完全关闭
-			c.stateMux.Lock()
-			if c.conn != nil {
-				_ = c.conn.CloseNow()
-				c.conn = nil
-			}
-			c.stateMux.Unlock()
 			// 等待一段时间再重连，使用指数退避
 			if attempt > 1 {
 				logger.Logrus().Debugf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
@@ -486,12 +521,15 @@ func (c *WSClient) reconnect() {
 				} else {
 					logger.Logrus().Debugf("waiting %v before reconnect attempt: %d", backoffDelay, attempt)
 				}
+				timer := time.NewTimer(backoffDelay)
 				select {
-				case <-time.After(backoffDelay):
+				case <-timer.C:
 				case <-c.ctx.Done():
+					timer.Stop()
 					logger.Logrus().Warningln("reconnect cancelled: context cancelled during backoff")
 					return
 				}
+				timer.Stop()
 				// 指数退避，但不超过最大值
 				backoffDelay *= 2
 				if backoffDelay > maxBackoff {
@@ -501,12 +539,15 @@ func (c *WSClient) reconnect() {
 
 			// 尝试重新建立连接
 			if err := c.dial(); err != nil {
-				logger.Logrus().Warningln("reconnect attempt %d failed: %v", attempt, err)
+				logger.Logrus().Warningf("reconnect attempt %d failed: %v", attempt, err)
 				continue
 			}
-			logger.Logrus().Debugf("websocket reconnect successful")
+			if !c.transitionState(StateReconnecting, StateConnected) {
+				c.closeCurrentConnection()
+				return
+			}
+			logger.Logrus().Debugln("websocket reconnect successful")
 			// 重连成功
-			c.setState(StateConnected)
 			// 重新启动消息处理和心跳
 			c.startMessageHandler()
 			if c.onConnected != nil {
@@ -517,12 +558,24 @@ func (c *WSClient) reconnect() {
 
 		// 重连失败，关闭客户端
 		logger.Logrus().Warningln("websocket reconnect failed after all attempts")
-		c.setState(StateDisconnected)
+		c.transitionState(StateReconnecting, StateDisconnected)
 		if c.onError != nil {
 			c.onError(ErrReconnectAttemptsExhausted)
 		}
-		_ = c.Close()
+		go func() {
+			_ = c.Close()
+		}()
 	}()
+}
+
+func (c *WSClient) closeCurrentConnection() {
+	c.connMux.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.connMux.Unlock()
+	if conn != nil {
+		_ = conn.CloseNow()
+	}
 }
 
 // Close 关闭连接
@@ -532,31 +585,54 @@ func (c *WSClient) Close() error {
 
 // Ping 发送心跳包
 func (c *WSClient) Ping() error {
-	return c.conn.Ping(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+	return c.PingContext(ctx)
+}
+
+// PingContext 使用指定上下文发送心跳包。
+func (c *WSClient) PingContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !c.IsConnected() {
+		return ErrClientNotConnected
+	}
+	c.connMux.RLock()
+	conn := c.conn
+	c.connMux.RUnlock()
+	if conn == nil {
+		return ErrConnectionNil
+	}
+	return conn.Ping(ctx)
+}
+
+func cloneDialOptions(options *websocket.DialOptions) *websocket.DialOptions {
+	if options == nil {
+		return nil
+	}
+	cloned := *options
+	cloned.HTTPHeader = options.HTTPHeader.Clone()
+	cloned.Subprotocols = append([]string(nil), options.Subprotocols...)
+	return &cloned
 }
 
 // CloseWithError 带错误信息的关闭连接
 func (c *WSClient) CloseWithError(closeErr error) error {
-	var err error
 	c.closeOnce.Do(func() {
 		logger.Logrus().Traceln("close websocket client ...")
-		c.setState(StateClosed)
-		// 关闭WebSocket连接
-		c.stateMux.Lock()
-		if c.conn != nil {
-			err = c.conn.Close(websocket.StatusNormalClosure, "client closed")
-			c.conn = nil
-		}
-		c.stateMux.Unlock()
-
-		// 取消context，通知所有协程退出
+		previousState := ConnectionState(c.state.Swap(int32(StateClosed)))
+		c.workerMux.Lock()
+		c.workersClosed = true
+		c.workerMux.Unlock()
 		c.cancel()
-
-		// 关闭通道
-		c.sendMux.Lock()
-		close(c.receiveChan)
-		close(c.sendChan)
-		c.sendMux.Unlock()
+		c.connMux.Lock()
+		conn := c.conn
+		c.conn = nil
+		c.connMux.Unlock()
+		if conn != nil {
+			c.closeResult = conn.Close(websocket.StatusNormalClosure, "client closed")
+		}
 
 		// 等待所有工作协程完成
 		done := make(chan struct{})
@@ -567,15 +643,21 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		}()
 
 		// 等待所有协程退出，但设置超时防止死锁
+		workersStopped := false
+		timer := time.NewTimer(time.Second * 5)
+		defer timer.Stop()
 		select {
 		case <-done:
+			workersStopped = true
 			logger.Logrus().Traceln("all worker goroutines exited")
-		case <-time.After(time.Second * 5):
+		case <-timer.C:
 			logger.Logrus().Warningln("timeout waiting for worker goroutines to exit")
 		}
+		if workersStopped {
+			close(c.receiveChan)
+		}
 
-		// 先调用断开连接回调（可能会被多次调用）
-		if c.onDisconnected != nil {
+		if c.onDisconnected != nil && previousState != StateDisconnected && previousState != StateReconnecting && previousState != StateClosed && previousState != StateWaitToConnect {
 			c.onDisconnected(closeErr)
 		}
 
@@ -585,5 +667,5 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		}
 		logger.Logrus().Traceln("websocket client closed successfully")
 	})
-	return err
+	return c.closeResult
 }

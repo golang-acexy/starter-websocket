@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/acexy/golang-toolkit/crypto/hashing"
 	"github.com/acexy/golang-toolkit/logger"
 	"github.com/acexy/golang-toolkit/math/random"
+	"github.com/acexy/golang-toolkit/util/coll"
 	"github.com/coder/websocket"
 )
 
@@ -58,7 +60,7 @@ type Handler func(message Message, conn *Conn)
 type ConnIdentifier func(request *Request) (string, error)
 
 type handlerWrapper struct {
-	mux            sync.Mutex
+	mux            sync.RWMutex
 	uniqueConnId   bool
 	connIdentifier ConnIdentifier
 	handler        Handler
@@ -74,8 +76,8 @@ type Conn struct {
 	conn           *websocket.Conn
 	request        *http.Request
 
-	createdAt       time.Time // 创建时间
-	lastReceivePing time.Time // 最后一次收到ping
+	createdAt       time.Time    // 创建时间
+	lastReceivePing atomic.Int64 // 最后一次收到ping的Unix纳秒时间戳
 }
 
 // SendMessage 发送数据(适用于简短消息)
@@ -128,8 +130,8 @@ func (r *Request) GetHeader(key string) string {
 }
 
 func (h *handlerWrapper) getConn(connId, internalConnId string) (*Conn, bool) {
-	defer h.mux.Unlock()
-	h.mux.Lock()
+	defer h.mux.RUnlock()
+	h.mux.RLock()
 	cs, flag := h.allConn[connId]
 	if flag {
 		c, flag := cs[internalConnId]
@@ -138,54 +140,69 @@ func (h *handlerWrapper) getConn(connId, internalConnId string) (*Conn, bool) {
 	return nil, false
 }
 
-func (h *handlerWrapper) hasConn(connId string) bool {
-	defer h.mux.Unlock()
+func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) []*Conn {
 	h.mux.Lock()
-	cs, flag := h.allConn[connId]
-	return flag && len(cs) > 0
-}
-
-func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) {
-	defer h.mux.Unlock()
-	h.mux.Lock()
-	v, flag := h.allConn[connId]
-	if flag {
-		v[internalConnId] = conn
-	} else {
+	var replaced []*Conn
+	if h.uniqueConnId {
+		replaced = coll.MapValues(h.allConn[connId])
 		h.allConn[connId] = map[string]*Conn{internalConnId: conn}
+	} else {
+		connections := h.allConn[connId]
+		if connections == nil {
+			connections = make(map[string]*Conn)
+			h.allConn[connId] = connections
+		}
+		connections[internalConnId] = conn
 	}
+	h.mux.Unlock()
+	return replaced
 }
 
 func (h *handlerWrapper) closeConnById(connId string) {
-	defer h.mux.Unlock()
 	h.mux.Lock()
-	c, flag := h.allConn[connId]
-	if flag {
-		for i, v := range c {
-			_ = v.conn.CloseNow()
-			v.cancel()
-			delete(c, i)
-		}
-		delete(h.allConn, connId)
+	connections := h.allConn[connId]
+	delete(h.allConn, connId)
+	h.mux.Unlock()
+	coll.MapForEachAll(connections, func(_ string, conn *Conn) {
+		conn.closeNow()
+	})
+	if len(connections) > 0 {
 		logger.Logrus().Infoln("connection closed:", connId)
 	}
 }
 func (h *handlerWrapper) closeConnByInternalId(connId, internalConnId string) {
-	defer h.mux.Unlock()
 	h.mux.Lock()
-	cs, flag := h.allConn[connId]
-	if flag {
-		c, flag := cs[internalConnId]
-		if flag {
-			_ = c.conn.CloseNow()
-			c.cancel()
-		}
-		delete(cs, internalConnId)
-		if len(cs) == 0 {
+	connections := h.allConn[connId]
+	conn := connections[internalConnId]
+	if conn != nil {
+		delete(connections, internalConnId)
+		if len(connections) == 0 {
 			delete(h.allConn, connId)
 		}
+	}
+	h.mux.Unlock()
+	if conn != nil {
+		conn.closeNow()
 		logger.Logrus().Infoln("connection closed:", connId)
 	}
+}
+
+func (h *handlerWrapper) closeAllConnections() {
+	h.mux.Lock()
+	groups := coll.MapValues(h.allConn)
+	h.allConn = make(map[string]map[string]*Conn)
+	h.mux.Unlock()
+	connections := coll.SliceFlat(coll.SliceCollect(groups, func(group map[string]*Conn) []*Conn {
+		return coll.MapValues(group)
+	}))
+	coll.SliceForEachAll(connections, func(conn *Conn) {
+		conn.closeNow()
+	})
+}
+
+func (c *Conn) closeNow() {
+	_ = c.conn.CloseNow()
+	c.cancel()
 }
 
 func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -206,10 +223,6 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if h.hasConn(connId) {
-			logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists, replace the old conn")
-			h.closeConnById(connId)
-		}
 	}
 	ctx, cancel := context.WithCancel(request.Context())
 	config := currentWebsocketConfig()
@@ -218,9 +231,9 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		cancel()
 		return
 	}
-	opt := config.AcceptOptions
-	if opt == nil {
-		opt = &websocket.AcceptOptions{}
+	opt := websocket.AcceptOptions{}
+	if config.AcceptOptions != nil {
+		opt = *config.AcceptOptions
 	}
 
 	// 启用默认keepalive规则
@@ -229,7 +242,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		opt.OnPingReceived = func(ctx context.Context, payload []byte) bool {
 			c, flag := h.getConn(connId, internalConnId)
 			if flag {
-				c.lastReceivePing = time.Now()
+				c.lastReceivePing.Store(time.Now().UnixNano())
 				return true
 			}
 			return false
@@ -245,19 +258,17 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				case <-ticker.C:
 					c, flag := h.getConn(connId, internalConnId)
 					if flag {
-						var lastReceivePing time.Time
-						if c.lastReceivePing.IsZero() {
-							lastReceivePing = c.createdAt
-						} else {
-							lastReceivePing = c.lastReceivePing
+						lastReceivePing := c.lastReceivePing.Load()
+						if lastReceivePing == 0 {
+							lastReceivePing = c.createdAt.UnixNano()
 						}
-						if time.Now().Sub(lastReceivePing) > keepAliveConfig.PingTimeout {
+						if time.Since(time.Unix(0, lastReceivePing)) > keepAliveConfig.PingTimeout {
 							logger.Logrus().Infoln("connection ping timeout:", connId, keepAliveConfig.PingTimeout)
 							h.closeConnByInternalId(connId, internalConnId)
 							return
 						}
 						if keepAliveConfig.MaxConnectTime > 0 {
-							if time.Now().Sub(c.createdAt) > keepAliveConfig.MaxConnectTime { // 检查最大时间
+							if time.Since(c.createdAt) > keepAliveConfig.MaxConnectTime { // 检查最大时间
 								logger.Logrus().Infoln("connection connect too long:", connId, keepAliveConfig.MaxConnectTime)
 								h.closeConnByInternalId(connId, internalConnId)
 								return
@@ -269,7 +280,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}()
 	}
 
-	conn, err := websocket.Accept(writer, request, opt)
+	conn, err := websocket.Accept(writer, request, &opt)
 	if err != nil {
 		logger.Logrus().WithError(err).Errorln("connId:", connId, "accept failed with error:", err)
 		cancel()
@@ -284,7 +295,13 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		request:        request,
 		createdAt:      time.Now(),
 	}
-	h.saveConn(connId, internalConnId, wsConn)
+	replacedConnections := h.saveConn(connId, internalConnId, wsConn)
+	if len(replacedConnections) > 0 {
+		logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists, replace the old conn")
+		coll.SliceForEachAll(replacedConnections, func(replaced *Conn) {
+			replaced.closeNow()
+		})
+	}
 	defer func() {
 		h.closeConnByInternalId(connId, internalConnId)
 	}()
