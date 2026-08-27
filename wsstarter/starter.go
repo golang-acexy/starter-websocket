@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/acexy/golang-toolkit/logger"
@@ -14,12 +15,25 @@ import (
 	"github.com/golang-acexy/starter-parent/parent"
 )
 
-var webSocketConfig *WebsocketConfig
-var server *http.Server
-var serverHandlers []*handlerWrapper
-var serverDone <-chan struct{}
-var serverStarting bool
-var serverLock sync.RWMutex
+var websocketRuntimeState atomic.Pointer[websocketRuntime]
+var serverLifecycleLock sync.Mutex
+var serverState websocketLifecycleState
+
+type websocketRuntime struct {
+	config   *WebsocketConfig
+	server   *http.Server
+	handlers []*handlerWrapper
+	done     <-chan struct{}
+}
+
+type websocketLifecycleState uint8
+
+const (
+	websocketStopped websocketLifecycleState = iota
+	websocketStarting
+	websocketRunning
+	websocketStopping
+)
 
 type WebsocketConfig struct {
 	ListenAddress string // ip:port
@@ -108,20 +122,23 @@ func (w *WebsocketStarter) Start() (any, error) {
 	if err := validateWebsocketConfig(config); err != nil {
 		return nil, err
 	}
-	serverLock.Lock()
-	if server != nil || serverStarting {
-		current := server
-		serverLock.Unlock()
-		return current, ErrWebsocketServerAlreadyStarted
+	serverLifecycleLock.Lock()
+	if serverState != websocketStopped {
+		current := websocketRuntimeState.Load()
+		serverLifecycleLock.Unlock()
+		if current != nil {
+			return current.server, ErrWebsocketServerAlreadyStarted
+		}
+		return nil, ErrWebsocketServerAlreadyStarted
 	}
-	serverStarting = true
-	serverLock.Unlock()
+	serverState = websocketStarting
+	serverLifecycleLock.Unlock()
 	started := false
 	defer func() {
 		if !started {
-			serverLock.Lock()
-			serverStarting = false
-			serverLock.Unlock()
+			serverLifecycleLock.Lock()
+			serverState = websocketStopped
+			serverLifecycleLock.Unlock()
 		}
 	}()
 
@@ -159,13 +176,11 @@ func (w *WebsocketStarter) Start() (any, error) {
 		Handler: serveMux,
 	}
 	done := make(chan struct{})
-	serverLock.Lock()
-	server = wsServer
-	serverHandlers = handlers
-	serverDone = done
-	serverStarting = false
-	webSocketConfig = config
-	serverLock.Unlock()
+	runtime := &websocketRuntime{config: config, server: wsServer, handlers: handlers, done: done}
+	serverLifecycleLock.Lock()
+	websocketRuntimeState.Store(runtime)
+	serverState = websocketRunning
+	serverLifecycleLock.Unlock()
 	started = true
 
 	go func() {
@@ -176,29 +191,35 @@ func (w *WebsocketStarter) Start() (any, error) {
 		coll.SliceForEachAll(handlers, func(handler *handlerWrapper) {
 			handler.closeAllConnections()
 		})
-		clearWebsocketServer(wsServer)
+		clearWebsocketServer(runtime)
 	}()
 	return wsServer, nil
 }
 
 func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped bool, err error) {
-	wsServer, handlers, done := currentWebsocketServer()
-	if wsServer == nil {
+	serverLifecycleLock.Lock()
+	runtime := websocketRuntimeState.Load()
+	if serverState != websocketRunning || runtime == nil {
+		serverLifecycleLock.Unlock()
 		return false, true, ErrWebsocketServerNotStarted
 	}
-	coll.SliceForEachAll(handlers, func(handler *handlerWrapper) {
+	websocketRuntimeState.Store(nil)
+	serverState = websocketStopping
+	serverLifecycleLock.Unlock()
+
+	coll.SliceForEachAll(runtime.handlers, func(handler *handlerWrapper) {
 		handler.closeAllConnections()
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), maxWaitTime)
 	defer cancel()
-	if err = wsServer.Shutdown(ctx); err != nil {
+	if err = runtime.server.Shutdown(ctx); err != nil {
 		gracefully = false
-		_ = wsServer.Close()
+		_ = runtime.server.Close()
 	} else {
 		gracefully = true
 	}
 	select {
-	case <-done:
+	case <-runtime.done:
 		stopped = true
 	case <-ctx.Done():
 		stopped = false
@@ -206,9 +227,7 @@ func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped 
 			err = ctx.Err()
 		}
 	}
-	if stopped {
-		clearWebsocketServer(wsServer)
-	}
+	clearWebsocketServer(runtime)
 	return
 }
 
@@ -255,32 +274,36 @@ func registerWebsocketRoutes(serveMux *http.ServeMux, routers []*Router, handler
 
 // RawWebsocketServer 获取原始websocket http server实例。
 func RawWebsocketServer() *http.Server {
-	serverLock.RLock()
-	defer serverLock.RUnlock()
-	return server
+	runtime := websocketRuntimeState.Load()
+	if runtime == nil {
+		return nil
+	}
+	return runtime.server
 }
 
 func currentWebsocketServer() (*http.Server, []*handlerWrapper, <-chan struct{}) {
-	serverLock.RLock()
-	defer serverLock.RUnlock()
-	return server, coll.SliceCollect(serverHandlers, func(handler *handlerWrapper) *handlerWrapper {
+	runtime := websocketRuntimeState.Load()
+	if runtime == nil {
+		return nil, nil, nil
+	}
+	return runtime.server, coll.SliceCollect(runtime.handlers, func(handler *handlerWrapper) *handlerWrapper {
 		return handler
-	}), serverDone
+	}), runtime.done
 }
 
 func currentWebsocketConfig() *WebsocketConfig {
-	serverLock.RLock()
-	defer serverLock.RUnlock()
-	return webSocketConfig
+	runtime := websocketRuntimeState.Load()
+	if runtime == nil {
+		return nil
+	}
+	return runtime.config
 }
 
-func clearWebsocketServer(wsServer *http.Server) {
-	serverLock.Lock()
-	defer serverLock.Unlock()
-	if server == wsServer {
-		server = nil
-		serverHandlers = nil
-		serverDone = nil
-		webSocketConfig = nil
+func clearWebsocketServer(runtime *websocketRuntime) {
+	websocketRuntimeState.CompareAndSwap(runtime, nil)
+	serverLifecycleLock.Lock()
+	if serverState == websocketRunning || serverState == websocketStopping {
+		serverState = websocketStopped
 	}
+	serverLifecycleLock.Unlock()
 }
