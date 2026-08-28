@@ -1,9 +1,13 @@
 github.com/acexy/golang-toolkit v1.26.0 h1:BHdeRnGp8j5RGidu17Q5SmYU1Dy4th0URKPt/vd/zfc=
 github.com/acexy/golang-toolkit v1.26.0/go.mod h1:QJW7j9CMn8zBC8S0ksliJiEEQfOcfk3nQ2jm2yLaFqo=
+github.com/acexy/golang-toolkit v1.26.1 h1:bo2tOwZw5+76CR0X4W/4uLtXbiX5xDtoEKFbHH/yaTM=
+github.com/acexy/golang-toolkit v1.26.1/go.mod h1:QJW7j9CMn8zBC8S0ksliJiEEQfOcfk3nQ2jm2yLaFqo=
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/golang-acexy/starter-parent v1.26.0 h1:aN86/M5mLEq1Eq5rH9ksYXaCDA7Q1dEndL4hTroBR7Q=
 github.com/golang-acexy/starter-parent v1.26.0/go.mod h1:5ciK0T6HB2/Lh/GXe4JL2mBKwxa0efyGzX9JNJZp5lA=
+github.com/golang-acexy/starter-parent v1.26.1 h1:pq6E+3u3+FpzxdnOfOHrY/r3baYrl3+sJvbAC5sYqWM=
+github.com/golang-acexy/starter-parent v1.26.1/go.mod h1:AMDHCdtiGkrwwjon0uYxx2oB/eH2WFShWUUn6fsnP+s=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/iancoleman/strcase v0.3.0 h1:nTXanmYxhfFAMjZL34Ov6gkzEsSJZ5DbhxWjvSASxEI=
