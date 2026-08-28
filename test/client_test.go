@@ -2,98 +2,110 @@ package test
 
 import (
 	"context"
-	"fmt"
-	"sync"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/acexy/golang-toolkit/logger"
-	"github.com/acexy/golang-toolkit/sys"
+	"github.com/coder/websocket"
 	"github.com/golang-acexy/starter-websocket/wsstarter"
 )
 
-func TestClient(t *testing.T) {
-	logger.EnableConsole(logger.TraceLevel, false)
-	ctx, cancel := context.WithCancel(context.Background())
-	d := make(chan struct{})
-	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL: "wss://fstream.binance.com/market/ws/btcusdt@markPrice@1s",
-		//HttpProxyURL: "http://localhost:7890",
-		HttpProxyURLFn: func() string {
-			return "http://localhost:7890"
-		},
-		OnConnected: func() {
-			logger.Logrus().Infoln("ws connected")
-		},
-		OnDisconnected: func(err error) {
-			logger.Logrus().Infoln("ws disconnected", err)
-		},
-		OnClosed: func(err error) {
-			logger.Logrus().Infoln("ws closed")
-			d <- struct{}{}
+func TestClientSendReceiveAndClose(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			messageType, data, readErr := conn.Read(request.Context())
+			if readErr != nil {
+				return
+			}
+			if writeErr := conn.Write(request.Context(), messageType, data); writeErr != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	closed := make(chan struct{})
+	client := wsstarter.NewWSClient(context.Background(), wsstarter.WSClientConfig{
+		URL:              "ws" + strings.TrimPrefix(server.URL, "http"),
+		DisableReconnect: true,
+		OnClosed: func(error) {
+			close(closed)
 		},
 	})
-	dataChn, err := client.Connect()
+	messages, err := client.Connect()
 	if err != nil {
-		t.Error(err)
-		cancel()
-		return
+		t.Fatalf("connect failed: %v", err)
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for v := range dataChn {
-			fmt.Println(v.ToString())
+	if err = client.SendText("hello"); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	select {
+	case message := <-messages:
+		if message == nil || message.ToString() != "hello" {
+			t.Fatalf("unexpected message: %+v", message)
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-d
-	}()
-	sys.ShutdownHolding()
-	cancel()
-	//client.Close()
-	wg.Wait()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for echoed message")
+	}
+	if err = client.Ping(); err != nil {
+		t.Fatalf("ping failed: %v", err)
+	}
+	if err = client.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("close callback was not called")
+	}
+	if client.GetState() != wsstarter.StateClosed {
+		t.Fatalf("unexpected client state: %v", client.GetState())
+	}
+	if _, open := <-messages; open {
+		t.Fatal("receive channel should be closed after workers stop")
+	}
 }
 
-func TestConnectServer(t *testing.T) {
-	logger.EnableConsole(logger.TraceLevel)
-	ctx, cancel := context.WithCancel(context.Background())
-	client := wsstarter.NewWSClient(ctx, wsstarter.WSClientConfig{
-		URL: "ws://localhost:8081/ws?id=1",
-		OnConnected: func() {
-			logger.Logrus().Infoln("ws connected")
-		},
-		OnDisconnected: func(err error) {
-			logger.Logrus().Infoln("ws disconnected", err)
-		},
-		OnClosed: func(err error) {
-			logger.Logrus().Infoln("ws closed")
-		},
-	})
-	dataChn, err := client.Connect()
-	if err != nil {
-		t.Error(err)
-		cancel()
-		return
+func TestClientRejectsMissingURL(t *testing.T) {
+	client := wsstarter.NewWSClient(context.Background(), wsstarter.WSClientConfig{})
+	defer client.Close()
+	if _, err := client.Connect(); !errors.Is(err, wsstarter.ErrClientURLMissing) {
+		t.Fatalf("expected missing URL error, got: %v", err)
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for v := range dataChn {
-			fmt.Println(v)
-		}
-	}()
-	go func() {
-		for {
-			time.Sleep(time.Second * 10)
-			_ = client.Ping()
-		}
-	}()
-	sys.ShutdownHolding()
-	cancel()
-	wg.Wait()
+}
+
+func TestClientValidatesReconnectConfiguration(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   wsstarter.WSClientConfig
+		expected error
+	}{
+		{
+			name:     "negative attempts",
+			config:   wsstarter.WSClientConfig{URL: "ws://unused", MaxReconnectAttempts: -1},
+			expected: wsstarter.ErrReconnectAttemptsInvalid,
+		},
+		{
+			name:     "negative interval",
+			config:   wsstarter.WSClientConfig{URL: "ws://unused", ReconnectInterval: -time.Second},
+			expected: wsstarter.ErrReconnectIntervalInvalid,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := wsstarter.NewWSClient(context.Background(), test.config)
+			defer client.Close()
+			if _, err := client.Connect(); err != test.expected {
+				t.Fatalf("expected %v, got: %v", test.expected, err)
+			}
+		})
+	}
 }

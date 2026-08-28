@@ -3,23 +3,41 @@ package wsstarter
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/acexy/golang-toolkit/logger"
 	"github.com/acexy/golang-toolkit/util/coll"
-	"github.com/acexy/golang-toolkit/util/net"
 	"github.com/coder/websocket"
 	"github.com/golang-acexy/starter-parent/parent"
 )
 
-var webSocketConfig *WebsocketConfig
-var server *http.Server
-var serverLock sync.RWMutex
+var websocketRuntimeState atomic.Pointer[websocketRuntime]
+var serverLifecycleLock sync.Mutex
+var serverState websocketLifecycleState
+
+type websocketRuntime struct {
+	config   *WebsocketConfig
+	server   *http.Server
+	handlers []*handlerWrapper
+	done     <-chan struct{}
+}
+
+type websocketLifecycleState uint8
+
+const (
+	websocketStopped websocketLifecycleState = iota
+	websocketStarting
+	websocketRunning
+	websocketStopping
+)
 
 type WebsocketConfig struct {
 	ListenAddress string // ip:port
-	// websocket.AcceptOptions 原始参数设置 注意当设置DefaultKeepAliveConfig后 OnPingReceived & OnPongReceived 设置将被忽略
+	// websocket.AcceptOptions 原始参数设置。设置DefaultKeepAliveConfig后OnPingReceived将由Starter接管。
 	AcceptOptions  *websocket.AcceptOptions
 	ConnIdentifier ConnIdentifier
 
@@ -43,10 +61,13 @@ type WebsocketStarter struct {
 	LazyConfig func() WebsocketConfig
 
 	config           *WebsocketConfig
+	configLock       sync.Mutex
 	WebsocketSetting *parent.Setting
 }
 
 func (w *WebsocketStarter) getConfig() *WebsocketConfig {
+	w.configLock.Lock()
+	defer w.configLock.Unlock()
 	if w.config != nil {
 		return w.config
 	}
@@ -56,11 +77,30 @@ func (w *WebsocketStarter) getConfig() *WebsocketConfig {
 	} else {
 		config = w.Config
 	}
-	w.config = &config
-	serverLock.Lock()
-	webSocketConfig = &config
-	serverLock.Unlock()
+	w.config = cloneWebsocketConfig(config)
 	return w.config
+}
+
+func cloneWebsocketConfig(config WebsocketConfig) *WebsocketConfig {
+	cloned := config
+	if config.AcceptOptions != nil {
+		acceptOptions := *config.AcceptOptions
+		acceptOptions.Subprotocols = append([]string(nil), config.AcceptOptions.Subprotocols...)
+		acceptOptions.OriginPatterns = append([]string(nil), config.AcceptOptions.OriginPatterns...)
+		cloned.AcceptOptions = &acceptOptions
+	}
+	if config.DefaultKeepAliveConfig != nil {
+		keepAliveConfig := *config.DefaultKeepAliveConfig
+		cloned.DefaultKeepAliveConfig = &keepAliveConfig
+	}
+	cloned.Routers = coll.SliceCollect(config.Routers, func(router *Router) *Router {
+		if router == nil {
+			return nil
+		}
+		clonedRouter := *router
+		return &clonedRouter
+	})
+	return &cloned
 }
 
 func (w *WebsocketStarter) Setting() *parent.Setting {
@@ -79,109 +119,191 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 
 func (w *WebsocketStarter) Start() (any, error) {
 	config := w.getConfig()
-	if len(config.Routers) == 0 {
-		return nil, ErrMissRouters
+	if err := validateWebsocketConfig(config); err != nil {
+		return nil, err
 	}
-
-	// 检查配置
-	if config.DefaultKeepAliveConfig != nil && config.DefaultKeepAliveConfig.PingTimeout == 0 {
-		return nil, ErrKeepAlivePingTimeoutRequired
+	serverLifecycleLock.Lock()
+	if serverState != websocketStopped {
+		current := websocketRuntimeState.Load()
+		serverLifecycleLock.Unlock()
+		if current != nil {
+			return current.server, ErrWebsocketServerAlreadyStarted
+		}
+		return nil, ErrWebsocketServerAlreadyStarted
 	}
-	serverLock.Lock()
-	if server != nil {
-		current := server
-		serverLock.Unlock()
-		return current, ErrWebsocketServerAlreadyStarted
-	}
-	serverLock.Unlock()
+	serverState = websocketStarting
+	serverLifecycleLock.Unlock()
+	started := false
+	defer func() {
+		if !started {
+			serverLifecycleLock.Lock()
+			serverState = websocketStopped
+			serverLifecycleLock.Unlock()
+		}
+	}()
 
 	listenAddr := config.ListenAddress
+	if listenAddr == "" {
+		listenAddr = ":8081"
+	}
 	serveMux := http.NewServeMux()
-	var err error
-	coll.SliceForEach(config.Routers, func(router *Router) bool {
-		if router.Handler == nil {
-			err = fmt.Errorf("%w: %s", ErrRouterHandlerMissing, router.Path)
-			return false
-		}
-		serveMux.Handle(router.Path, &handlerWrapper{
+	handlers := coll.SliceCollect(config.Routers, func(router *Router) *handlerWrapper {
+		return &handlerWrapper{
 			connIdentifier: func() ConnIdentifier {
-				if config.GlobalConnIdentifier != nil && router.ConnIdentifier == nil {
+				if router.ConnIdentifier != nil {
+					return router.ConnIdentifier
+				}
+				if config.GlobalConnIdentifier != nil {
 					return config.GlobalConnIdentifier
 				}
-				return router.ConnIdentifier
+				return config.ConnIdentifier
 			}(),
 			handler:      router.Handler,
 			uniqueConnId: router.UniqueConnId,
 			allConn:      make(map[string]map[string]*Conn),
-		})
-		return true
+		}
 	})
-
+	if err := registerWebsocketRoutes(serveMux, config.Routers, handlers); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	if listenAddr == "" {
-		listenAddr = ":8081"
-	}
 
 	wsServer := &http.Server{
-		Addr:    listenAddr,
+		Addr:    listener.Addr().String(),
 		Handler: serveMux,
 	}
-	serverLock.Lock()
-	server = wsServer
-	serverLock.Unlock()
+	done := make(chan struct{})
+	runtime := &websocketRuntime{config: config, server: wsServer, handlers: handlers, done: done}
+	serverLifecycleLock.Lock()
+	websocketRuntimeState.Store(runtime)
+	serverState = websocketRunning
+	serverLifecycleLock.Unlock()
+	started = true
 
-	errChn := make(chan error, 1)
 	go func() {
-		if listenErr := wsServer.ListenAndServe(); listenErr != nil && listenErr != http.ErrServerClosed {
-			errChn <- listenErr
+		defer close(done)
+		if serveErr := wsServer.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			logger.Logrus().WithError(serveErr).Errorln("websocket server stopped unexpectedly")
 		}
+		coll.SliceForEachAll(handlers, func(handler *handlerWrapper) {
+			handler.closeAllConnections()
+		})
+		clearWebsocketServer(runtime)
 	}()
-	select {
-	case <-time.After(time.Second):
-		return wsServer, nil
-	case err = <-errChn:
-		clearWebsocketServer(wsServer)
-		return wsServer, err
-	}
+	return wsServer, nil
 }
 
 func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped bool, err error) {
-	wsServer := RawWebsocketServer()
-	if wsServer == nil {
+	serverLifecycleLock.Lock()
+	runtime := websocketRuntimeState.Load()
+	if serverState != websocketRunning || runtime == nil {
+		serverLifecycleLock.Unlock()
 		return false, true, ErrWebsocketServerNotStarted
 	}
+	websocketRuntimeState.Store(nil)
+	serverState = websocketStopping
+	serverLifecycleLock.Unlock()
+
+	coll.SliceForEachAll(runtime.handlers, func(handler *handlerWrapper) {
+		handler.closeAllConnections()
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), maxWaitTime)
 	defer cancel()
-	if err = wsServer.Shutdown(ctx); err != nil {
+	if err = runtime.server.Shutdown(ctx); err != nil {
 		gracefully = false
+		_ = runtime.server.Close()
 	} else {
 		gracefully = true
 	}
-	stopped = !net.Telnet(w.getConfig().ListenAddress, time.Second)
-	clearWebsocketServer(wsServer)
+	select {
+	case <-runtime.done:
+		stopped = true
+	case <-ctx.Done():
+		stopped = false
+		if err == nil {
+			err = ctx.Err()
+		}
+	}
+	clearWebsocketServer(runtime)
 	return
+}
+
+func validateWebsocketConfig(config *WebsocketConfig) error {
+	if len(config.Routers) == 0 {
+		return ErrMissRouters
+	}
+	if config.DefaultKeepAliveConfig != nil && config.DefaultKeepAliveConfig.PingTimeout <= 0 {
+		return ErrKeepAlivePingTimeoutRequired
+	}
+	if config.DefaultKeepAliveConfig != nil && config.DefaultKeepAliveConfig.MaxConnectTime < 0 {
+		return ErrKeepAliveMaxConnectTimeInvalid
+	}
+	paths := make(map[string]struct{}, len(config.Routers))
+	for _, router := range config.Routers {
+		if router == nil {
+			return ErrRouterNil
+		}
+		if router.Path == "" {
+			return ErrRouterPathMissing
+		}
+		if router.Handler == nil {
+			return fmt.Errorf("%w: %s", ErrRouterHandlerMissing, router.Path)
+		}
+		if _, exists := paths[router.Path]; exists {
+			return fmt.Errorf("%w: %s", ErrRouterPathDuplicate, router.Path)
+		}
+		paths[router.Path] = struct{}{}
+	}
+	return nil
+}
+
+func registerWebsocketRoutes(serveMux *http.ServeMux, routers []*Router, handlers []*handlerWrapper) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%w: %v", ErrRouterPathInvalid, recovered)
+		}
+	}()
+	for index, router := range routers {
+		serveMux.Handle(router.Path, handlers[index])
+	}
+	return nil
 }
 
 // RawWebsocketServer 获取原始websocket http server实例。
 func RawWebsocketServer() *http.Server {
-	serverLock.RLock()
-	defer serverLock.RUnlock()
-	return server
+	runtime := websocketRuntimeState.Load()
+	if runtime == nil {
+		return nil
+	}
+	return runtime.server
+}
+
+func currentWebsocketServer() (*http.Server, []*handlerWrapper, <-chan struct{}) {
+	runtime := websocketRuntimeState.Load()
+	if runtime == nil {
+		return nil, nil, nil
+	}
+	return runtime.server, coll.SliceCollect(runtime.handlers, func(handler *handlerWrapper) *handlerWrapper {
+		return handler
+	}), runtime.done
 }
 
 func currentWebsocketConfig() *WebsocketConfig {
-	serverLock.RLock()
-	defer serverLock.RUnlock()
-	return webSocketConfig
+	runtime := websocketRuntimeState.Load()
+	if runtime == nil {
+		return nil
+	}
+	return runtime.config
 }
 
-func clearWebsocketServer(wsServer *http.Server) {
-	serverLock.Lock()
-	defer serverLock.Unlock()
-	if server == wsServer {
-		server = nil
-		webSocketConfig = nil
+func clearWebsocketServer(runtime *websocketRuntime) {
+	websocketRuntimeState.CompareAndSwap(runtime, nil)
+	serverLifecycleLock.Lock()
+	if serverState == websocketRunning || serverState == websocketStopping {
+		serverState = websocketStopped
 	}
+	serverLifecycleLock.Unlock()
 }
