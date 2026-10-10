@@ -15,20 +15,29 @@ import (
 	"github.com/coder/websocket"
 )
 
-// ConnectionState 连接状态枚举
+// ConnectionState describes a client lifecycle observation, not a guarantee of transport availability.
 type ConnectionState int32
 
 const defaultDataChanLength = 500
 
 const (
+	// StateWaitToConnect permits the initial Connect call.
 	StateWaitToConnect ConnectionState = iota
+	// StateDisconnected indicates an initial dial failure or a disconnection without active retry.
 	StateDisconnected
+	// StateConnecting indicates an initial dial in progress.
 	StateConnecting
+	// StateConnected permits queueing and pinging but does not guarantee remote delivery.
 	StateConnected
+	// StateReconnecting indicates automatic retry after an established connection fails.
 	StateReconnecting
+	// StateClosed is terminal; create a new client to connect again.
 	StateClosed
 )
 
+// WSClient owns a transport, message queues, and reconnect workers; create it with NewWSClient.
+// Send, state reads, ping, and closure coordinate shared state, but observations can become stale.
+// Do not copy after use. Callbacks must handle their own synchronization and failure policy.
 type WSClient struct {
 	url string
 
@@ -41,11 +50,9 @@ type WSClient struct {
 	ctx      context.Context
 	opts     *websocket.DialOptions
 
-	// 连接状态管理
 	state   atomic.Int32
 	connMux sync.RWMutex
 
-	// 重连配置
 	maxReconnectAttempts int
 	reconnectInterval    time.Duration
 	disableReconnect     bool
@@ -53,57 +60,81 @@ type WSClient struct {
 
 	readMaxBytesLimit int64
 
-	// 数据通道
 	blockReceive bool
 	receiveChan  chan *Message
 
-	// 发送队列
 	blockSender bool
 	sendChan    chan *Message
 	sendMux     sync.Mutex
 
-	// 回调函数
 	onConnected    func()
 	onDisconnected func(error)
 	onError        func(error)
-	onClosed       func(error) // 客户端关闭时的一次性回调
+	onClosed       func(error)
 
-	// 优雅关闭
 	closeOnce   sync.Once
 	closeResult error
 
-	// 用于跟踪各个协程的完成状态
 	workerWg      sync.WaitGroup
 	workerMux     sync.Mutex
 	workersClosed bool
 }
 
-// WSClientConfig 配置结构
+// WSClientConfig defines construction-time transport, queue, retry, and callback policies.
 type WSClientConfig struct {
-	URL            string
-	HttpProxyURLFn func() string // 代理构造函数 权重高于HttpProxyURL
-	HttpProxyURL   string
-	DialOptions    *websocket.DialOptions
+	// URL is the non-empty ws or wss endpoint validated when Connect dials.
+	URL string
+	// HttpProxyURLFn is consulted per dial and overrides HttpProxyURL; an empty result does not fall back to it.
+	HttpProxyURLFn func() string
+	// HttpProxyURL supplies a static proxy when HttpProxyURLFn is nil; empty leaves DialOptions unchanged.
+	HttpProxyURL string
+	// DialOptions supplies library options; headers and subprotocols are copied, but HTTPClient remains shared.
+	// A selected proxy replaces HTTPClient.
+	DialOptions *websocket.DialOptions
 
-	DisableReconnect     bool          // 禁用重连 (权重大于ForceReconnect)
-	ForceReconnect       bool          // 是否强制重连 只要监测到连接状态异常，就会无限尝试重连
-	MaxReconnectAttempts int           // 默认重连3次
-	ReconnectInterval    time.Duration // 默认2秒，指数级自动增加等待时间最长1m
+	// DisableReconnect disables automatic reconnect even when ForceReconnect is true.
+	DisableReconnect bool
+	// ForceReconnect retries normal closures too and uses a practically unbounded attempt limit unless disabled.
+	ForceReconnect bool
+	// MaxReconnectAttempts bounds automatic retries; zero defaults to three and negatives are rejected by
+	// Connect.
+	MaxReconnectAttempts int
+	// ReconnectInterval defaults to two seconds at zero; negatives are rejected. The first retry is immediate,
+	// followed by exponential waits capped after each wait at one minute.
+	ReconnectInterval time.Duration
 
-	ReceiveChanBufferLen int   // 接收数据通道缓冲长度 非阻塞式模式生效 默认 500
-	SendChanBufferLen    int   // 发送数据通道缓冲长度 非阻塞式模式生效 默认 500
-	ReadMaxBytesLimit    int64 // 接收数据最大字节数限制
+	// ReceiveChanBufferLen sets receive capacity in either blocking mode; nonpositive values default to 500.
+	ReceiveChanBufferLen int
+	// SendChanBufferLen sets send capacity in either blocking mode; nonpositive values default to 500.
+	SendChanBufferLen int
+	// ReadMaxBytesLimit overrides the library read limit only when positive; zero and negatives retain its
+	// default.
+	ReadMaxBytesLimit int64
 
-	BlockReceive bool // 阻塞式接收数据
-	BlockSender  bool // 阻塞式发送数据
+	// BlockReceive waits for queue capacity; false drops new frames when full. Blocking also delays
+	// control-frame processing.
+	BlockReceive bool
+	// BlockSender waits for queue capacity or cancellation; false returns ErrSendChannelFull when full.
+	BlockSender bool
 
-	// 回调函数
-	OnConnected    func()
+	// OnConnected runs after initial or reconnect success; nil disables it. Keep it short and handle callback
+	// failures.
+	OnConnected func()
+	// OnDisconnected reports a transition away from a connection; callbacks can run in workers, so avoid
+	// blocking lifecycle calls.
 	OnDisconnected func(error)
-	OnError        func(error)
-	OnClosed       func(error) // 客户端关闭时的一次性回调，保证只调用一次
+	// OnError reports write errors and exhausted retries, not every failure; callbacks from separate paths may
+	// overlap.
+	OnError func(error)
+	// OnClosed runs once after closure waiting; nil disables it. Never call Close or CloseWithError recursively
+	// from this callback.
+	OnClosed func(error)
 }
 
+// NewWSClient copies configuration and starts context monitoring without dialing.
+// A nil context uses context.Background; cancellation initiates closure. Use Close
+// to release even never-connected or initially failed clients. Header/subprotocol
+// options are copied, while callback state and a supplied HTTPClient remain caller-owned.
 func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 	if ctx == nil {
 		ctx = context.Background()
@@ -143,13 +174,12 @@ func NewWSClient(ctx context.Context, config WSClientConfig) *WSClient {
 		readMaxBytesLimit:    config.ReadMaxBytesLimit,
 	}
 	client.setState(StateWaitToConnect)
-	// 启动context监听协程，当context取消时执行优雅关闭
 	client.workerWg.Add(1)
 	go client.contextMonitor()
 	return client
 }
 
-// contextMonitor 监听context取消事件，执行优雅关闭
+// contextMonitor deregisters itself before closing to avoid waiting on its own worker.
 func (c *WSClient) contextMonitor() {
 	<-c.ctx.Done()
 	logger.Logrus().Traceln("context cancelled, initiating graceful shutdown")
@@ -157,6 +187,7 @@ func (c *WSClient) contextMonitor() {
 	_ = c.Close()
 }
 
+// addWorker serializes worker registration against closure.
 func (c *WSClient) addWorker() bool {
 	c.workerMux.Lock()
 	defer c.workerMux.Unlock()
@@ -167,12 +198,11 @@ func (c *WSClient) addWorker() bool {
 	return true
 }
 
-// setState 设置连接状态
 func (c *WSClient) setState(state ConnectionState) {
 	c.state.Store(int32(state))
 }
 
-// GetState 获取连接状态
+// GetState atomically observes the current state; it is not a readiness or delivery guarantee.
 func (c *WSClient) GetState() ConnectionState {
 	return ConnectionState(c.state.Load())
 }
@@ -181,12 +211,16 @@ func (c *WSClient) transitionState(from, to ConnectionState) bool {
 	return c.state.CompareAndSwap(int32(from), int32(to))
 }
 
-// IsConnected 检查是否已连接
+// IsConnected observes connected state; the transport can disconnect immediately afterward.
 func (c *WSClient) IsConnected() bool {
 	return c.GetState() == StateConnected
 }
 
-// Connect 连接到 WebSocket 服务器
+// Connect dials once from StateWaitToConnect and returns the receive channel on success.
+// Invalid configuration is rejected before the transition. An initial dial failure
+// leaves the client disconnected without automatic retry; create a new client to retry.
+// Consume messages promptly. Close owns the channel and may leave it open if workers
+// do not finish within the closure wait; callers must also observe context and callbacks.
 func (c *WSClient) Connect() (<-chan *Message, error) {
 	if c.url == "" {
 		return nil, ErrClientURLMissing
@@ -200,7 +234,6 @@ func (c *WSClient) Connect() (<-chan *Message, error) {
 	if !c.transitionState(StateWaitToConnect, StateConnecting) {
 		return nil, ErrClientNotWaitToConnect
 	}
-	// 建立连接
 	if err := c.dial(); err != nil {
 		c.transitionState(StateConnecting, StateDisconnected)
 		return nil, fmt.Errorf("failed to connect: %w", err)
@@ -209,9 +242,7 @@ func (c *WSClient) Connect() (<-chan *Message, error) {
 		c.closeCurrentConnection()
 		return nil, ErrClientClosing
 	}
-	// 启动消息处理协程
 	c.startMessageHandler()
-	// 启动发送协程
 	c.startMessageSender()
 	if c.onConnected != nil {
 		c.onConnected()
@@ -220,7 +251,7 @@ func (c *WSClient) Connect() (<-chan *Message, error) {
 	return c.receiveChan, nil
 }
 
-// dial 建立 WebSocket 连接
+// dial applies current proxy selection and publishes a successful transport under the connection lock.
 func (c *WSClient) dial() error {
 	dialOptions := websocket.DialOptions{}
 	if c.opts != nil {
@@ -264,7 +295,7 @@ func (c *WSClient) dial() error {
 	return nil
 }
 
-// startMessageHandler 启动消息处理协程
+// startMessageHandler reads frames until failure or cancellation, applying configured queue backpressure.
 func (c *WSClient) startMessageHandler() {
 	if !c.addWorker() {
 		return
@@ -277,7 +308,6 @@ func (c *WSClient) startMessageHandler() {
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Logrus().Errorf("websocket message handlerWrapper panic: %v", r)
-				// 发生panic时也要触发重连
 				c.handleConnectionError(fmt.Errorf("message handlerWrapper panic: %v", r))
 			}
 		}()
@@ -304,10 +334,8 @@ func (c *WSClient) startMessageHandler() {
 					return
 				}
 
-				// 移除超时设置，让Read操作阻塞直到有消息或连接断开
 				messageType, data, err := conn.Read(c.ctx)
 				if err != nil {
-					// 检查是否是context取消导致的错误
 					if c.ctx.Err() != nil {
 						logger.Logrus().Warningln("websocket read interrupted by context cancellation")
 						return
@@ -316,7 +344,6 @@ func (c *WSClient) startMessageHandler() {
 					c.handleConnectionError(err)
 					return
 				}
-				// 处理普通消息
 				if c.blockReceive {
 					select {
 					case c.receiveChan <- &Message{Type: messageType, Data: data}:
@@ -337,7 +364,7 @@ func (c *WSClient) startMessageHandler() {
 	}()
 }
 
-// startMessageSender 启动发送协程
+// startMessageSender drains the send queue without durable replay across connection failures.
 func (c *WSClient) startMessageSender() {
 	if !c.addWorker() {
 		return
@@ -369,12 +396,10 @@ func (c *WSClient) startMessageSender() {
 					continue
 				}
 
-				// 设置写入超时（写入超时是合理的）
 				writeCtx, cancel := context.WithTimeout(c.ctx, time.Second*10)
 				err := conn.Write(writeCtx, data.Type, data.Data)
 				cancel()
 				if err != nil {
-					// 检查是否是context取消导致的错误
 					if c.ctx.Err() != nil {
 						logger.Logrus().Traceln("websocket write interrupted by context cancellation")
 						return
@@ -383,7 +408,6 @@ func (c *WSClient) startMessageSender() {
 					if c.onError != nil {
 						c.onError(err)
 					}
-					// 写入失败可能意味着连接有问题，触发重连检查
 					go c.handleConnectionError(err)
 				}
 			case <-c.ctx.Done():
@@ -394,7 +418,11 @@ func (c *WSClient) startMessageSender() {
 	}()
 }
 
-// Send 发送消息
+// Send queues a frame while connected; concurrent producers are serialized.
+// Success means enqueueing, not remote delivery. Bytes are not copied: hand off
+// ownership and do not mutate them while queued or in use. BlockSender waits for
+// capacity or cancellation; otherwise a full queue returns ErrSendChannelFull.
+// Disconnects and write failures can lose queued frames; message type is not validated here.
 func (c *WSClient) Send(messageType websocket.MessageType, data []byte) error {
 	c.sendMux.Lock()
 	defer c.sendMux.Unlock()
@@ -420,19 +448,19 @@ func (c *WSClient) Send(messageType websocket.MessageType, data []byte) error {
 	}
 }
 
-// SendText 发送文本消息
+// SendText allocates and queues text with Send delivery semantics; an empty string is allowed.
 func (c *WSClient) SendText(text string) error {
 	return c.Send(websocket.MessageText, []byte(text))
 }
 
-// SendBinary 发送二进制消息
+// SendBinary queues binary data without copying; nil and empty payloads are allowed. Keep queued bytes
+// unchanged.
 func (c *WSClient) SendBinary(data []byte) error {
 	return c.Send(websocket.MessageBinary, data)
 }
 
-// handleConnectionError 处理连接错误
+// handleConnectionError elects one disconnected or reconnecting transition for a transport failure.
 func (c *WSClient) handleConnectionError(err error) {
-	// 检查是否是context取消导致的错误
 	if c.ctx.Err() != nil {
 		logger.Logrus().Warningln("connection error ignored due to context cancellation")
 		return
@@ -462,7 +490,7 @@ func (c *WSClient) handleConnectionError(err error) {
 	}
 }
 
-// shouldReconnect 判断是否应该重连
+// shouldReconnect applies disable-first policy and otherwise filters normal closure unless forced.
 func (c *WSClient) shouldReconnect(err error) bool {
 	if c.disableReconnect {
 		return false
@@ -479,7 +507,7 @@ func (c *WSClient) shouldReconnect(err error) bool {
 	}
 }
 
-// reconnect 重连逻辑
+// reconnect retries transport establishment without restoring application sessions or replaying messages.
 func (c *WSClient) reconnect() {
 	if c.GetState() != StateReconnecting {
 		return
@@ -491,7 +519,7 @@ func (c *WSClient) reconnect() {
 	go func() {
 		defer c.workerWg.Done()
 		backoffDelay := c.reconnectInterval
-		maxBackoff := time.Minute // 最大间隔不超过一分钟
+		maxBackoff := time.Minute
 		var maxReconnectAttempts int
 		if c.forceReconnect {
 			maxReconnectAttempts = math.MaxInt
@@ -499,7 +527,6 @@ func (c *WSClient) reconnect() {
 			maxReconnectAttempts = c.maxReconnectAttempts
 		}
 		for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
-			// 检查context是否已取消
 			if c.ctx.Err() != nil {
 				logger.Logrus().Warningln("reconnect cancelled: context cancelled")
 				return
@@ -513,7 +540,6 @@ func (c *WSClient) reconnect() {
 			} else {
 				logger.Logrus().Debugf("websocket reconnect attempt: %d/%d", attempt, c.maxReconnectAttempts)
 			}
-			// 等待一段时间再重连，使用指数退避
 			if attempt > 1 {
 				logger.Logrus().Debugf("waiting %v before reconnect attempt %d", backoffDelay, attempt)
 				if c.forceReconnect {
@@ -530,14 +556,12 @@ func (c *WSClient) reconnect() {
 					return
 				}
 				timer.Stop()
-				// 指数退避，但不超过最大值
 				backoffDelay *= 2
 				if backoffDelay > maxBackoff {
 					backoffDelay = maxBackoff
 				}
 			}
 
-			// 尝试重新建立连接
 			if err := c.dial(); err != nil {
 				logger.Logrus().Warningf("reconnect attempt %d failed: %v", attempt, err)
 				continue
@@ -547,8 +571,7 @@ func (c *WSClient) reconnect() {
 				return
 			}
 			logger.Logrus().Debugln("websocket reconnect successful")
-			// 重连成功
-			// 重新启动消息处理和心跳
+			// Restart the reader only; the sender keeps consuming the shared queue.
 			c.startMessageHandler()
 			if c.onConnected != nil {
 				c.onConnected()
@@ -556,7 +579,6 @@ func (c *WSClient) reconnect() {
 			return
 		}
 
-		// 重连失败，关闭客户端
 		logger.Logrus().Warningln("websocket reconnect failed after all attempts")
 		c.transitionState(StateReconnecting, StateDisconnected)
 		if c.onError != nil {
@@ -578,19 +600,24 @@ func (c *WSClient) closeCurrentConnection() {
 	}
 }
 
-// Close 关闭连接
+// Close permanently closes the client using CloseWithError(nil).
+// Repeated or concurrent calls share one closure result. Do not invoke it recursively
+// from closure callbacks; avoid blocking closure from worker callbacks.
 func (c *WSClient) Close() error {
 	return c.CloseWithError(nil)
 }
 
-// Ping 发送心跳包
+// Ping sends a ping and waits for pong with a ten-second deadline; no periodic heartbeat is scheduled.
 func (c *WSClient) Ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 	return c.PingContext(ctx)
 }
 
-// PingContext 使用指定上下文发送心跳包。
+// PingContext sends a ping and waits for pong on the current connected transport.
+// A nil context uses context.Background with no deadline. Concurrent calls are
+// supported, but a blocked receive worker can delay pong processing. A disconnected
+// client returns ErrClientNotConnected; a missing transport returns ErrConnectionNil.
 func (c *WSClient) PingContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -617,7 +644,12 @@ func cloneDialOptions(options *websocket.DialOptions) *websocket.DialOptions {
 	return &cloned
 }
 
-// CloseWithError 带错误信息的关闭连接
+// CloseWithError closes once, forwarding closeErr to callbacks rather than returning it.
+// The return value is the underlying transport close error, not a worker timeout.
+// After transport closure it waits up to five seconds for workers; the receive
+// channel closes only if they finish. Queued sends are not flushed. Callbacks execute
+// synchronously inside the one-time closure: recursive Close or CloseWithError deadlocks.
+// Blocking closure from a worker callback can exhaust the wait and leave receive open.
 func (c *WSClient) CloseWithError(closeErr error) error {
 	c.closeOnce.Do(func() {
 		logger.Logrus().Traceln("close websocket client ...")
@@ -634,7 +666,6 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 			c.closeResult = conn.Close(websocket.StatusNormalClosure, "client closed")
 		}
 
-		// 等待所有工作协程完成
 		done := make(chan struct{})
 		go func() {
 			c.workerWg.Wait()
@@ -642,7 +673,6 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 			close(done)
 		}()
 
-		// 等待所有协程退出，但设置超时防止死锁
 		workersStopped := false
 		timer := time.NewTimer(time.Second * 5)
 		defer timer.Stop()
@@ -653,6 +683,7 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		case <-timer.C:
 			logger.Logrus().Warningln("timeout waiting for worker goroutines to exit")
 		}
+		// Never close the receive channel while a worker may still send into it.
 		if workersStopped {
 			close(c.receiveChan)
 		}
@@ -661,7 +692,6 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 			c.onDisconnected(closeErr)
 		}
 
-		// 最后调用关闭回调（保证只调用一次）
 		if c.onClosed != nil {
 			c.onClosed(closeErr)
 		}
