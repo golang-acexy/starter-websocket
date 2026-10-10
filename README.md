@@ -34,7 +34,7 @@ Supported capabilities:
 - Raw `websocket.AcceptOptions` passthrough. When default keepalive is enabled, ping handling is owned by the starter.
 - Raw server access through `RawWebsocketServer()`.
 
-The starter validates nil routers, empty or duplicate paths, missing handlers, and invalid keepalive durations before binding the listener. Configuration and `AcceptOptions` are cloned before use so concurrent connections cannot overwrite each other's ping callbacks. Startup binds the listener synchronously, and shutdown closes all upgraded WebSocket connections before stopping the HTTP server.
+Configure non-nil routes with unique valid patterns, handlers, and positive keepalive ping timeouts before startup. Startup returns listener errors directly, and shutdown closes upgraded WebSocket connections as well as the HTTP server.
 
 ```go
 starter := &wsstarter.WebsocketStarter{
@@ -62,7 +62,7 @@ starter := &wsstarter.WebsocketStarter{
 }
 
 loader := parent.InitStarterLoader([]parent.Starter{starter})
-_, err := loader.Start()
+err := loader.Start()
 ```
 
 ## Client Mode
@@ -102,7 +102,11 @@ Client configuration highlights:
 - `ReceiveChanBufferLen`, `SendChanBufferLen`, and `ReadMaxBytesLimit` for queue and read limits.
 - `SendText`, `SendBinary`, `Ping`, `PingContext`, `Close`, and `GetState` for common operations.
 
-Client state transitions use atomic compare-and-swap operations, so concurrent connection failures can start at most one reconnect flow. Closing first prevents new workers, cancels the client context, closes the active connection, waits for workers, and then closes the receive channel. The send channel remains internal and is not closed while producers or workers may still reference it.
+An initial connection failure does not automatically reconnect, and the same client cannot call `Connect` again; close it and construct a new client. After an established connection fails, `DisableReconnect` takes priority over `ForceReconnect`. Without forcing, normal server closure does not reconnect.
+
+A successful send means queue acceptance, not delivery. Binary buffers are not copied; keep queued data unchanged. Full receive queues drop new messages unless `BlockReceive` is enabled. Blocking consumption can delay ping/pong processing. No periodic client heartbeat is scheduled; call `Ping` regularly when the server requires it.
+
+Close clients explicitly and keep callbacks short. Do not recursively call `Close` from `OnClosed`, or synchronously close from worker callbacks. The receive channel may remain open if workers exceed the closure wait; consumers should also observe context cancellation or a closure callback. A disconnected client without retries remains open until explicitly closed.
 
 ## Error Handling
 
@@ -112,6 +116,6 @@ Common starter and client errors are defined in `wsstarter/error.go`, including 
 
 Use the parent loader for server startup and shutdown in integration code. Keep each router focused on one WebSocket endpoint, and place connection authentication or ID extraction in `ConnIdentifier` rather than inside message handlers.
 
-`WebsocketStarter` is the only standard starter that enables parent-managed restart. After `StopStarter` completes successfully, calling `StartStarter("Websocket-Starter")` starts it again with the current static or lazy configuration. Other standard starters reject this lifecycle transition with `parent.ErrStarterRestartDisabled`.
+`WebsocketStarter` is the only standard starter that enables parent-managed restart. After `StopStarter` completes successfully, calling `StartStarter("Websocket-Starter")` starts it again with the configuration cached at first resolution. Later changes to `Config` or `LazyConfig` do not refresh that configuration. Other standard starters reject this lifecycle transition with `parent.ErrStarterRestartDisabled`.
 
 Tests use local random ports and in-process WebSocket servers. They do not require external services, local proxies, fixed ports, or indefinite shutdown holding.

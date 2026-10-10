@@ -16,12 +16,16 @@ import (
 	"github.com/coder/websocket"
 )
 
-// Message Websocket 数据
+// Message holds a text or binary frame; Data ownership depends on its producer and is not automatically
+// copied.
 type Message struct {
+	// Type selects text or binary framing; callers must supply a supported message type.
 	Type websocket.MessageType
+	// Data is the payload; do not mutate shared bytes while a send or consumer uses them.
 	Data []byte
 }
 
+// ToString returns text verbatim or non-text bytes in hexadecimal; the receiver must be non-nil.
 func (m *Message) ToString() string {
 	if m.Type == websocket.MessageText {
 		return string(m.Data)
@@ -29,7 +33,7 @@ func (m *Message) ToString() string {
 	return fmt.Sprintf("%x", m.Data)
 }
 
-// NewTextMessage 创建一个文本数据
+// NewTextMessage allocates a text payload; an empty string produces an empty message.
 func NewTextMessage(data string) *Message {
 	return &Message{
 		Type: websocket.MessageText,
@@ -37,7 +41,7 @@ func NewTextMessage(data string) *Message {
 	}
 }
 
-// NewBinaryMessage 创建一个二进制数据
+// NewBinaryMessage wraps data without copying; nil or empty data produces an empty binary message.
 func NewBinaryMessage(data []byte) *Message {
 	return &Message{
 		Type: websocket.MessageBinary,
@@ -45,18 +49,27 @@ func NewBinaryMessage(data []byte) *Message {
 	}
 }
 
-// Router WS路由
+// Router defines a ServeMux pattern and its connection policy; configure it before starter resolution.
 type Router struct {
-	Path           string         // 路由路径
-	UniqueConnId   bool           // 该路由下 连接标识是否强制唯一，若设置为强制唯一，重复链接的标识旧的将被自动关闭
-	ConnIdentifier ConnIdentifier // 连接标识 (可用于鉴权并为链接标识唯一id)
-	Handler        Handler        // 路由处理函数
+	// Path is a non-empty ServeMux pattern; duplicate or invalid patterns are rejected at startup.
+	Path string
+	// UniqueConnId requires a non-empty identity and closes older connections with the same identity on this
+	// route.
+	UniqueConnId bool
+	// ConnIdentifier overrides server identifiers; nil falls back to global then default identification.
+	ConnIdentifier ConnIdentifier
+	// Handler must be non-nil and handles messages synchronously for each connection.
+	Handler Handler
 }
 
-// Handler 消息处理器
+// Handler processes a frame in its connection's read loop; different connections may call it concurrently.
+// Keep shared application state safe, avoid blocking reads for long periods, and handle
+// application failures explicitly; this wrapper does not recover handler panics.
 type Handler func(message Message, conn *Conn)
 
-// ConnIdentifier 连接鉴权并返回链接标识Id
+// ConnIdentifier authenticates a handshake and returns an application identity.
+// It can run concurrently across handshakes. An error returns HTTP 403; an empty identity
+// is allowed only when uniqueness is disabled. Avoid mutating the request concurrently.
 type ConnIdentifier func(request *Request) (string, error)
 
 type handlerWrapper struct {
@@ -67,64 +80,79 @@ type handlerWrapper struct {
 	allConn        map[string]map[string]*Conn
 }
 
+// Conn wraps one server-side transport and its registered identity.
+// Send methods delegate concurrent write serialization to the WebSocket library;
+// shared payloads still require caller ownership. Use handler-provided instances only.
 type Conn struct {
-	ConnId string // 连接标识Id 应用层分配
+	// ConnId is the application identity; treat it as read-only because cleanup uses this registry key.
+	ConnId string
 
-	internalConnId string // 内部连接标识唯一
+	internalConnId string
 	handlerWrapper *handlerWrapper
 	cancel         context.CancelFunc
 	conn           *websocket.Conn
 	request        *http.Request
 
-	createdAt       time.Time    // 创建时间
-	lastReceivePing atomic.Int64 // 最后一次收到ping的Unix纳秒时间戳
+	createdAt       time.Time
+	lastReceivePing atomic.Int64
 }
 
-// SendMessage 发送数据(适用于简短消息)
+// SendMessage writes a complete frame using a background context with no explicit deadline.
+// Concurrent sends are supported; keep payload bytes unchanged until the call returns.
+// An open stream writer must close before another write can proceed.
 func (c *Conn) SendMessage(message Message) error {
 	return c.conn.Write(context.Background(), message.Type, message.Data)
 }
 
-// SendMessageCtx 发送数据(适用于简短消息)
+// SendMessageCtx writes a complete frame bounded by a non-nil context.
+// Concurrent sends are supported; keep payload bytes unchanged until the call returns.
 func (c *Conn) SendMessageCtx(ctx context.Context, message Message) error {
 	return c.conn.Write(ctx, message.Type, message.Data)
 }
 
-// GetTextMessageWriter 获取文本发送写入流
+// GetTextMessageWriter opens a text stream with no explicit deadline.
+// The caller must close it to finish the frame and release other waiting writes.
 func (c *Conn) GetTextMessageWriter() (io.WriteCloser, error) {
 	return c.GetTextMessageWriterCtx(context.Background())
 }
 
-// GetBinaryMessageWriter 获取byte发送写入流
+// GetBinaryMessageWriter opens a binary stream with no explicit deadline.
+// The caller must close it to finish the frame and release other waiting writes.
 func (c *Conn) GetBinaryMessageWriter() (io.WriteCloser, error) {
 	return c.GetBinaryMessageWriterCtx(context.Background())
 }
 
-// GetTextMessageWriterCtx 获取文本发送写入流
+// GetTextMessageWriterCtx opens a text stream bounded by a non-nil context.
+// Only one message writer is active at a time; close it before requesting another writer.
 func (c *Conn) GetTextMessageWriterCtx(ctx context.Context) (io.WriteCloser, error) {
 	return c.conn.Writer(ctx, websocket.MessageText)
 }
 
-// GetBinaryMessageWriterCtx 获取byte发送写入流
+// GetBinaryMessageWriterCtx opens a binary stream bounded by a non-nil context.
+// Only one message writer is active at a time; close it before requesting another writer.
 func (c *Conn) GetBinaryMessageWriterCtx(ctx context.Context) (io.WriteCloser, error) {
 	return c.conn.Writer(ctx, websocket.MessageBinary)
 }
 
+// Close removes and immediately closes this registered connection without a close handshake.
+// Concurrent or repeated closure is safe; replacement connections with the same identity
+// are preserved. ConnId must remain unchanged.
 func (c *Conn) Close() {
 	c.handlerWrapper.closeConnByInternalId(c.ConnId, c.internalConnId)
 }
 
-// Request 请求包裹
+// Request exposes the HTTP handshake request; use the non-nil wrapper supplied to identification callbacks.
 type Request struct {
+	// Request is the underlying handshake request; treat shared request data as read-only.
 	*http.Request
 }
 
-// GetQuery 获取请求参数
+// GetQuery returns the first query value for key, or an empty string when absent.
 func (r *Request) GetQuery(key string) string {
 	return r.URL.Query().Get(key)
 }
 
-// GetHeader 获取请求头
+// GetHeader returns the first header value for key, or an empty string when absent.
 func (r *Request) GetHeader(key string) string {
 	return r.Header.Get(key)
 }
@@ -140,6 +168,7 @@ func (h *handlerWrapper) getConn(connId, internalConnId string) (*Conn, bool) {
 	return nil, false
 }
 
+// saveConn installs the replacement before returning old connections for closure outside the registry lock.
 func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) []*Conn {
 	h.mux.Lock()
 	var replaced []*Conn
@@ -170,6 +199,8 @@ func (h *handlerWrapper) closeConnById(connId string) {
 		logger.Logrus().Infoln("connection closed:", connId)
 	}
 }
+
+// closeConnByInternalId removes only this internal ID so old cleanup cannot delete a replacement.
 func (h *handlerWrapper) closeConnByInternalId(connId, internalConnId string) {
 	h.mux.Lock()
 	connections := h.allConn[connId]
@@ -205,6 +236,7 @@ func (c *Conn) closeNow() {
 	c.cancel()
 }
 
+// ServeHTTP authenticates and upgrades a handshake, then dispatches frames until transport closure.
 func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	var connId string
 	internalConnId := hashing.Sha256Hex(random.UUID() + time.Now().String() + random.RandString(20))
@@ -236,9 +268,8 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		opt = *config.AcceptOptions
 	}
 
-	// 启用默认keepalive规则
+	// Install a per-handshake ping callback without changing shared accept options.
 	if config.DefaultKeepAliveConfig != nil {
-		// 启用了默认的keepalive规则
 		opt.OnPingReceived = func(ctx context.Context, payload []byte) bool {
 			c, flag := h.getConn(connId, internalConnId)
 			if flag {
@@ -268,7 +299,7 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 							return
 						}
 						if keepAliveConfig.MaxConnectTime > 0 {
-							if time.Since(c.createdAt) > keepAliveConfig.MaxConnectTime { // 检查最大时间
+							if time.Since(c.createdAt) > keepAliveConfig.MaxConnectTime {
 								logger.Logrus().Infoln("connection connect too long:", connId, keepAliveConfig.MaxConnectTime)
 								h.closeConnByInternalId(connId, internalConnId)
 								return

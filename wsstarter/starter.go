@@ -35,36 +35,52 @@ const (
 	websocketStopping
 )
 
+// WebsocketConfig defines one server's routes and handshake policies.
+// Configure it before first resolution; later changes do not refresh the starter's cache.
 type WebsocketConfig struct {
-	ListenAddress string // ip:port
-	// websocket.AcceptOptions 原始参数设置。设置DefaultKeepAliveConfig后OnPingReceived将由Starter接管。
-	AcceptOptions  *websocket.AcceptOptions
+	// ListenAddress is the TCP bind address; empty uses :8081 and port zero selects a free port.
+	ListenAddress string
+	// AcceptOptions configures handshakes; nil uses library defaults. Keepalive overrides OnPingReceived.
+	AcceptOptions *websocket.AcceptOptions
+	// ConnIdentifier is the fallback identifier after router and global identifiers.
 	ConnIdentifier ConnIdentifier
 
-	GlobalConnIdentifier ConnIdentifier // 全局连接标识符/鉴权操作 将覆盖未设置该行为的router
-	Routers              []*Router      // WS路由设置
+	// GlobalConnIdentifier overrides the fallback for routes without their own identifier.
+	GlobalConnIdentifier ConnIdentifier
+	// Routers must contain non-nil routes with unique non-empty patterns and non-nil handlers.
+	Routers []*Router
 
-	DefaultKeepAliveConfig *DefaultKeepAliveConfig // 默认的KeepAlive配置 如果不设置则不起用该规则
+	// DefaultKeepAliveConfig enables passive ping checks; nil disables both timeout and lifetime checks.
+	DefaultKeepAliveConfig *DefaultKeepAliveConfig
 }
 
-// DefaultKeepAliveConfig 默认的KeepAlive配置
-// 默认连接保持采用被动模式
-// 客户端需要在指定时间内发送ws的ping帧，服务端自动回复ws的pong帧
-// 如果超过指定时间没有收到ping帧，则主动断开连接
+// DefaultKeepAliveConfig closes connections missing client ping frames or exceeding their lifetime.
+// Application messages do not refresh the ping deadline; clients must schedule pings.
 type DefaultKeepAliveConfig struct {
-	PingTimeout    time.Duration // ping帧的超时时间
-	MaxConnectTime time.Duration // 连接保持最大时长 不设置时则不启用该规则
+	// PingTimeout must be positive; before the first ping it is measured from connection creation.
+	PingTimeout time.Duration
+	// MaxConnectTime limits connection lifetime; zero disables the limit and negative values are invalid.
+	MaxConnectTime time.Duration
 }
 
+// WebsocketStarter manages the process-wide WebSocket HTTP server.
+// Use one server lifecycle owner, configure fields before use, and do not copy after use.
+// Restart is supported and reuses the first resolved configuration.
 type WebsocketStarter struct {
-	Config     WebsocketConfig
+	// Config supplies static settings when LazyConfig is nil.
+	Config WebsocketConfig
+	// LazyConfig takes precedence over Config and is evaluated once; it must not recursively resolve this
+	// starter.
 	LazyConfig func() WebsocketConfig
 
-	config           *WebsocketConfig
-	configLock       sync.Mutex
+	config     *WebsocketConfig
+	configLock sync.Mutex
+	// WebsocketSetting overrides parent lifecycle defaults; nil enables restart and a 30-second synchronous
+	// stop.
 	WebsocketSetting *parent.Setting
 }
 
+// getConfig resolves and caches a cloned configuration under the instance lock.
 func (w *WebsocketStarter) getConfig() *WebsocketConfig {
 	w.configLock.Lock()
 	defer w.configLock.Unlock()
@@ -81,6 +97,7 @@ func (w *WebsocketStarter) getConfig() *WebsocketConfig {
 	return w.config
 }
 
+// cloneWebsocketConfig isolates routes and mutable option slices without cloning callback-owned state.
 func cloneWebsocketConfig(config WebsocketConfig) *WebsocketConfig {
 	cloned := config
 	if config.AcceptOptions != nil {
@@ -103,6 +120,8 @@ func cloneWebsocketConfig(config WebsocketConfig) *WebsocketConfig {
 	return &cloned
 }
 
+// Setting returns custom parent settings or restart-enabled defaults.
+// Configure WebsocketSetting before use; defaults use name Websocket-Starter and priority one.
 func (w *WebsocketStarter) Setting() *parent.Setting {
 	if w.WebsocketSetting != nil {
 		return w.WebsocketSetting
@@ -117,6 +136,10 @@ func (w *WebsocketStarter) Setting() *parent.Setting {
 		})
 }
 
+// Start validates cached configuration, binds TCP, and returns the raw *http.Server.
+// The server is process-wide; another active lifecycle returns ErrWebsocketServerAlreadyStarted.
+// Binding and route failures are returned before runtime publication. Later Serve failures
+// are logged and are not returned through this method. Restart keeps the cached configuration.
 func (w *WebsocketStarter) Start() (any, error) {
 	config := w.getConfig()
 	if err := validateWebsocketConfig(config); err != nil {
@@ -196,6 +219,11 @@ func (w *WebsocketStarter) Start() (any, error) {
 	return wsServer, nil
 }
 
+// Stop withdraws the process-wide server, closes upgraded connections, and stops HTTP serving.
+// maxWaitTime bounds HTTP shutdown and the subsequent Serve wait, not preceding connection cleanup.
+// Zero or negative durations expire immediately; shutdown failure forces HTTP closure.
+// An inactive server returns stopped=true with ErrWebsocketServerNotStarted.
+// Inspect both flags and err: timeout can return stopped=false after initiating closure.
 func (w *WebsocketStarter) Stop(maxWaitTime time.Duration) (gracefully, stopped bool, err error) {
 	serverLifecycleLock.Lock()
 	runtime := websocketRuntimeState.Load()
@@ -272,7 +300,9 @@ func registerWebsocketRoutes(serveMux *http.ServeMux, routers []*Router, handler
 	return nil
 }
 
-// RawWebsocketServer 获取原始websocket http server实例。
+// RawWebsocketServer returns the current HTTP server, or nil when unavailable or stopping.
+// Lookup is synchronized but the returned pointer is borrowed and does not guarantee
+// continued availability. Leave server lifecycle control to WebsocketStarter.
 func RawWebsocketServer() *http.Server {
 	runtime := websocketRuntimeState.Load()
 	if runtime == nil {
@@ -299,6 +329,7 @@ func currentWebsocketConfig() *WebsocketConfig {
 	return runtime.config
 }
 
+// clearWebsocketServer withdraws matching runtime state and resets lifecycle availability.
 func clearWebsocketServer(runtime *websocketRuntime) {
 	websocketRuntimeState.CompareAndSwap(runtime, nil)
 	serverLifecycleLock.Lock()
