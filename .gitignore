@@ -24,3 +24,6 @@ go.work
 .idea
 .DS_Store
 *.log
+
+# Local link to workspace internal documentation
+/docs
