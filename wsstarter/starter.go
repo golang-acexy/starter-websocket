@@ -18,6 +18,7 @@ import (
 var websocketRuntimeState atomic.Pointer[websocketRuntime]
 var serverLifecycleLock sync.Mutex
 var serverState websocketLifecycleState
+var serverLifecycleRuntime *websocketRuntime
 
 type websocketRuntime struct {
 	config   *WebsocketConfig
@@ -181,6 +182,7 @@ func (w *WebsocketStarter) Start() (any, error) {
 				}
 				return config.ConnIdentifier
 			}(),
+			config:       config,
 			handler:      router.Handler,
 			uniqueConnId: router.UniqueConnId,
 			allConn:      make(map[string]map[string]*Conn),
@@ -202,6 +204,7 @@ func (w *WebsocketStarter) Start() (any, error) {
 	runtime := &websocketRuntime{config: config, server: wsServer, handlers: handlers, done: done}
 	serverLifecycleLock.Lock()
 	websocketRuntimeState.Store(runtime)
+	serverLifecycleRuntime = runtime
 	serverState = websocketRunning
 	serverLifecycleLock.Unlock()
 	started = true
@@ -331,9 +334,10 @@ func currentWebsocketConfig() *WebsocketConfig {
 
 // clearWebsocketServer withdraws matching runtime state and resets lifecycle availability.
 func clearWebsocketServer(runtime *websocketRuntime) {
-	websocketRuntimeState.CompareAndSwap(runtime, nil)
 	serverLifecycleLock.Lock()
-	if serverState == websocketRunning || serverState == websocketStopping {
+	if serverLifecycleRuntime == runtime {
+		websocketRuntimeState.CompareAndSwap(runtime, nil)
+		serverLifecycleRuntime = nil
 		serverState = websocketStopped
 	}
 	serverLifecycleLock.Unlock()

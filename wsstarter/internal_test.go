@@ -40,11 +40,11 @@ func TestUniqueConnectionRegistrationReplacesAtomically(t *testing.T) {
 	}
 	first := &Conn{ConnId: "same", internalConnId: "first"}
 	second := &Conn{ConnId: "same", internalConnId: "second"}
-	if replaced := handler.saveConn("same", "first", first); len(replaced) != 0 {
+	if replaced, accepted := handler.saveConn("same", "first", first); !accepted || len(replaced) != 0 {
 		t.Fatalf("unexpected initial replacement: %+v", replaced)
 	}
-	replaced := handler.saveConn("same", "second", second)
-	if len(replaced) != 1 || replaced[0] != first {
+	replaced, accepted := handler.saveConn("same", "second", second)
+	if !accepted || len(replaced) != 1 || replaced[0] != first {
 		t.Fatalf("unexpected replaced connections: %+v", replaced)
 	}
 	actual, ok := handler.getConn("same", "second")

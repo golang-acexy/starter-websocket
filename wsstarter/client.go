@@ -126,8 +126,8 @@ type WSClientConfig struct {
 	// OnError reports write errors and exhausted retries, not every failure; callbacks from separate paths may
 	// overlap.
 	OnError func(error)
-	// OnClosed runs once after closure waiting; nil disables it. Never call Close or CloseWithError recursively
-	// from this callback.
+	// OnClosed runs once after closure waiting; nil disables it. Calling Close again is safe.
+	// Keep it short; other Close callers need not wait for this callback to finish.
 	OnClosed func(error)
 }
 
@@ -219,8 +219,8 @@ func (c *WSClient) IsConnected() bool {
 // Connect dials once from StateWaitToConnect and returns the receive channel on success.
 // Invalid configuration is rejected before the transition. An initial dial failure
 // leaves the client disconnected without automatic retry; create a new client to retry.
-// Consume messages promptly. Close owns the channel and may leave it open if workers
-// do not finish within the closure wait; callers must also observe context and callbacks.
+// Consume messages promptly. Close owns the channel and closes it after all workers exit,
+// including workers that outlive the closure wait; callers must also observe context.
 func (c *WSClient) Connect() (<-chan *Message, error) {
 	if c.url == "" {
 		return nil, ErrClientURLMissing
@@ -278,6 +278,8 @@ func (c *WSClient) dial() error {
 			transport := &http.Transport{
 				Proxy: http.ProxyURL(proxyURL),
 			}
+			// Failed handshakes can leave idle proxy connections in this per-dial transport.
+			defer transport.CloseIdleConnections()
 			dialOptions.HTTPClient = &http.Client{Transport: transport}
 		}
 	}
@@ -601,8 +603,8 @@ func (c *WSClient) closeCurrentConnection() {
 }
 
 // Close permanently closes the client using CloseWithError(nil).
-// Repeated or concurrent calls share one closure result. Do not invoke it recursively
-// from closure callbacks; avoid blocking closure from worker callbacks.
+// Repeated or concurrent calls share one closure result. Closure callbacks may call it again;
+// worker callbacks should initiate closure asynchronously to avoid waiting on themselves.
 func (c *WSClient) Close() error {
 	return c.CloseWithError(nil)
 }
@@ -647,17 +649,22 @@ func cloneDialOptions(options *websocket.DialOptions) *websocket.DialOptions {
 // CloseWithError closes once, forwarding closeErr to callbacks rather than returning it.
 // The return value is the underlying transport close error, not a worker timeout.
 // After transport closure it waits up to five seconds for workers; the receive
-// channel closes only if they finish. Queued sends are not flushed. Callbacks execute
-// synchronously inside the one-time closure: recursive Close or CloseWithError deadlocks.
-// Blocking closure from a worker callback can exhaust the wait and leave receive open.
+// channel closes when they finish, even after the wait expires. Pending sends are discarded.
+// The closure owner runs callbacks synchronously after one-time cleanup, allowing reentrant
+// Close calls. Other callers may return before callbacks finish. Blocking worker callbacks
+// can exhaust the wait; asynchronous closure avoids waiting on the calling worker.
 func (c *WSClient) CloseWithError(closeErr error) error {
+	closedHere := false
+	var previousState ConnectionState
 	c.closeOnce.Do(func() {
+		closedHere = true
 		logger.Logrus().Traceln("close websocket client ...")
-		previousState := ConnectionState(c.state.Swap(int32(StateClosed)))
+		previousState = ConnectionState(c.state.Swap(int32(StateClosed)))
 		c.workerMux.Lock()
 		c.workersClosed = true
 		c.workerMux.Unlock()
 		c.cancel()
+		c.discardPendingSends()
 		c.connMux.Lock()
 		conn := c.conn
 		c.conn = nil
@@ -669,25 +676,22 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 		done := make(chan struct{})
 		go func() {
 			c.workerWg.Wait()
+			// Only workers send to receiveChan; closure remains safe after a wait timeout.
+			close(c.receiveChan)
 			logger.Logrus().Traceln("all worker goroutines exited")
 			close(done)
 		}()
 
-		workersStopped := false
 		timer := time.NewTimer(time.Second * 5)
 		defer timer.Stop()
 		select {
 		case <-done:
-			workersStopped = true
 			logger.Logrus().Traceln("all worker goroutines exited")
 		case <-timer.C:
 			logger.Logrus().Warningln("timeout waiting for worker goroutines to exit")
 		}
-		// Never close the receive channel while a worker may still send into it.
-		if workersStopped {
-			close(c.receiveChan)
-		}
-
+	})
+	if closedHere {
 		if c.onDisconnected != nil && previousState != StateDisconnected && previousState != StateReconnecting && previousState != StateClosed && previousState != StateWaitToConnect {
 			c.onDisconnected(closeErr)
 		}
@@ -696,6 +700,19 @@ func (c *WSClient) CloseWithError(closeErr error) error {
 			c.onClosed(closeErr)
 		}
 		logger.Logrus().Traceln("websocket client closed successfully")
-	})
+	}
 	return c.closeResult
+}
+
+// discardPendingSends waits for pre-cancellation producers before releasing queued payloads.
+func (c *WSClient) discardPendingSends() {
+	c.sendMux.Lock()
+	defer c.sendMux.Unlock()
+	for {
+		select {
+		case <-c.sendChan:
+		default:
+			return
+		}
+	}
 }
