@@ -34,7 +34,7 @@ Supported capabilities:
 - Raw `websocket.AcceptOptions` passthrough. When default keepalive is enabled, ping handling is owned by the starter.
 - Raw server access through `RawWebsocketServer()`.
 
-Configure non-nil routes with unique valid patterns, handlers, and positive keepalive ping timeouts before startup. Startup returns listener errors directly, and shutdown closes upgraded WebSocket connections as well as the HTTP server.
+Configure non-nil routes with unique valid patterns, handlers, and positive keepalive ping timeouts before startup. Startup returns listener errors directly, and shutdown closes upgraded WebSocket connections as well as the HTTP server. Handshakes finishing during shutdown cannot leave a newly registered connection behind.
 
 ```go
 starter := &wsstarter.WebsocketStarter{
@@ -106,7 +106,7 @@ An initial connection failure does not automatically reconnect, and the same cli
 
 A successful send means queue acceptance, not delivery. Binary buffers are not copied; keep queued data unchanged. Full receive queues drop new messages unless `BlockReceive` is enabled. Blocking consumption can delay ping/pong processing. No periodic client heartbeat is scheduled; call `Ping` regularly when the server requires it.
 
-Close clients explicitly and keep callbacks short. Do not recursively call `Close` from `OnClosed`, or synchronously close from worker callbacks. The receive channel may remain open if workers exceed the closure wait; consumers should also observe context cancellation or a closure callback. A disconnected client without retries remains open until explicitly closed.
+Close clients explicitly and keep callbacks short. Closure callbacks may call `Close` again safely; worker callbacks should initiate closure asynchronously to avoid waiting on themselves. Close discards pending sends. The receive channel closes when all workers exit, including after the five-second wait expires; already queued received messages remain available. Consumers should also observe context cancellation. The caller performing cleanup runs closure callbacks synchronously, while other concurrent Close callers may return before those callbacks finish. A disconnected client without retries remains open until explicitly closed.
 
 ## Error Handling
 

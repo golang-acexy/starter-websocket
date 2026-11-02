@@ -78,6 +78,8 @@ type handlerWrapper struct {
 	connIdentifier ConnIdentifier
 	handler        Handler
 	allConn        map[string]map[string]*Conn
+	closed         bool
+	config         *WebsocketConfig
 }
 
 // Conn wraps one server-side transport and its registered identity.
@@ -169,8 +171,12 @@ func (h *handlerWrapper) getConn(connId, internalConnId string) (*Conn, bool) {
 }
 
 // saveConn installs the replacement before returning old connections for closure outside the registry lock.
-func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) []*Conn {
+func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) ([]*Conn, bool) {
 	h.mux.Lock()
+	if h.closed {
+		h.mux.Unlock()
+		return nil, false
+	}
 	var replaced []*Conn
 	if h.uniqueConnId {
 		replaced = coll.MapValues(h.allConn[connId])
@@ -184,7 +190,7 @@ func (h *handlerWrapper) saveConn(connId, internalConnId string, conn *Conn) []*
 		connections[internalConnId] = conn
 	}
 	h.mux.Unlock()
-	return replaced
+	return replaced, true
 }
 
 func (h *handlerWrapper) closeConnById(connId string) {
@@ -220,14 +226,13 @@ func (h *handlerWrapper) closeConnByInternalId(connId, internalConnId string) {
 
 func (h *handlerWrapper) closeAllConnections() {
 	h.mux.Lock()
-	groups := coll.MapValues(h.allConn)
-	h.allConn = make(map[string]map[string]*Conn)
+	h.closed = true
+	groups := h.allConn
+	h.allConn = nil
 	h.mux.Unlock()
-	connections := coll.SliceFlat(coll.SliceCollect(groups, func(group map[string]*Conn) []*Conn {
-		return coll.MapValues(group)
-	}))
-	coll.SliceForEachAll(connections, func(conn *Conn) {
-		conn.closeNow()
+	// Detach once; late upgrades cannot repopulate the retired registry.
+	coll.MapForEachAll(groups, func(_ string, connections map[string]*Conn) {
+		coll.MapForEachAll(connections, func(_ string, conn *Conn) { conn.closeNow() })
 	})
 }
 
@@ -257,8 +262,11 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}
 	}
 	ctx, cancel := context.WithCancel(request.Context())
-	config := currentWebsocketConfig()
-	if config == nil {
+	config := h.config
+	h.mux.RLock()
+	closed := h.closed
+	h.mux.RUnlock()
+	if config == nil || closed {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		cancel()
 		return
@@ -326,7 +334,11 @@ func (h *handlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		request:        request,
 		createdAt:      time.Now(),
 	}
-	replacedConnections := h.saveConn(connId, internalConnId, wsConn)
+	replacedConnections, accepted := h.saveConn(connId, internalConnId, wsConn)
+	if !accepted {
+		wsConn.closeNow()
+		return
+	}
 	if len(replacedConnections) > 0 {
 		logger.Logrus().Warningln("uniqueConnId is set true but connId:", connId, "already exists, replace the old conn")
 		coll.SliceForEachAll(replacedConnections, func(replaced *Conn) {
